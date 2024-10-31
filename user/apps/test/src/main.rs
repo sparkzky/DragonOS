@@ -72,31 +72,27 @@
 //     Ok(())
 // }
 
-
 //todo 第二版 手动终止
-use libc::{fcntl, F_SETFL};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use std::fs::{remove_file};
-use std::io::{Read, Result};
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 use core::ffi::{c_char, c_void};
 use libc::{
     chown, fchown, fchownat, getgrnam, getpwnam, gid_t, lchown, mount, uid_t, umount, AT_FDCWD,
     AT_SYMLINK_NOFOLLOW,
 };
+use libc::{fcntl, F_SETFL};
 use nix::errno::Errno;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use std::fs::remove_file;
+use std::io::{Read, Result};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use std::{
     ffi::CString,
     fs::{self, metadata, File},
     io::{self, Error, Write},
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
 };
 
@@ -125,37 +121,33 @@ fn main() -> Result<()> {
     let buffer = Arc::new(Mutex::new(vec![0u8; 1024])); // Use a larger buffer
     let buffer_clone = Arc::clone(&buffer);
 
-    {
-        let mut file = unsafe { File::from_raw_fd(fd) }; // Create file from raw file descriptor
-        println!("Starting blocking read operation...");
-        loop {
-            let mut buffer_lock = buffer_clone.lock().unwrap();
-            match file.read(&mut *buffer_lock) {
-                Ok(0) => {
-                    println!("No more data to read, exiting read");
-                    break;
-                }
-                Ok(n) => {
-                    // Output the number of bytes read, occupying the entire line
-                    // if n != 1024 {
-                        let output = format!("Read {} bytes", n);
-                        println!("{:<width$}", output, width = 80); // Adjust width as needed
-                    // }
-                }
-                Err(e) => {
-                    eprintln!("Read failed: {:?}", e);
-                    break;
-                }
+    let mut file = unsafe { File::from_raw_fd(fd) }; // Create file from raw file descriptor
+    println!("Starting blocking read operation...");
+    loop {
+        let mut buffer_lock = buffer_clone.lock().unwrap();
+        match file.read(&mut *buffer_lock) {
+            Ok(0) => {
+                println!("No more data to read, exiting read");
+                break;
             }
-            thread::sleep(Duration::from_secs(5));
+            Ok(n) => {
+                // Output the number of bytes read, occupying the entire line
+                // if n != 1024 {
+                let output = format!("Read {} bytes", n);
+                println!("{:<width$}", output, width = 80); // Adjust width as needed
+                                                            // }
+            }
+            Err(e) => {
+                eprintln!("Read failed: {:?}", e);
+                break;
+            }
         }
+        thread::sleep(Duration::from_secs(5));
     }
-
 
     umount_test_ramfs();
     Ok(())
 }
-
 
 fn mount_test_ramfs() {
     let path = Path::new("mnt/myramfs");
