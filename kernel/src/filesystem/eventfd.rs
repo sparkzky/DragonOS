@@ -5,6 +5,7 @@ use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
 use crate::process::ProcessManager;
+use crate::sched::SchedMode;
 use crate::syscall::Syscall;
 use alloc::collections::LinkedList;
 use alloc::string::String;
@@ -76,6 +77,12 @@ impl EventFdInode {
 
         Err(SystemError::ENOENT)
     }
+
+    fn readable(&self) -> bool {
+        let efd = self.eventfd.lock();
+        let rev = efd.count > 0;
+        return rev;
+    }
 }
 
 impl IndexNode for EventFdInode {
@@ -122,7 +129,10 @@ impl IndexNode for EventFdInode {
             {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            self.wait_queue.sleep();
+            let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
+            if r.is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
         };
 
         let mut eventfd = self.eventfd.lock();
