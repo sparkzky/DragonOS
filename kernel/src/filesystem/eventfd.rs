@@ -79,9 +79,8 @@ impl EventFdInode {
     }
 
     fn readable(&self) -> bool {
-        let efd = self.eventfd.lock();
-        let rev = efd.count > 0;
-        return rev;
+        let count = self.eventfd.lock().count;
+        return count > 0;
     }
 }
 
