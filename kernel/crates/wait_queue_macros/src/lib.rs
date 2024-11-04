@@ -51,9 +51,9 @@ macro_rules! __wq_wait_event(
 
             $cmd;
         }
-        if exec_finish_wait {
+
             $wq.finish_wait();
-        }
+
 
         retval
     }};

@@ -112,6 +112,8 @@ impl IndexNode for EventFdInode {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let data_guard = data.clone();
+        drop(data);
         if len < 8 {
             return Err(SystemError::EINVAL);
         }
@@ -161,7 +163,7 @@ impl IndexNode for EventFdInode {
         let val_bytes = val.to_ne_bytes();
         buf[..8].copy_from_slice(&val_bytes);
 
-        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data_guard)? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
