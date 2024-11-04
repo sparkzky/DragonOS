@@ -190,59 +190,59 @@
 // }
 
 
-// todo eventfd
-use std::io;
-use std::os::unix::io::RawFd;
-use libc::{eventfd, read};
+// // todo eventfd
+// use std::io;
+// use std::os::unix::io::RawFd;
+// use libc::{eventfd, read};
 
-fn create_blocking_eventfd() -> io::Result<RawFd> {
-    // 创建一个阻塞的 eventfd，初始计数器值为 0
-    let efd = unsafe { eventfd(0, 0) };
-    if efd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(efd)
-    }
-}
-
-fn main() -> io::Result<()> {
-    // 创建阻塞的 eventfd
-    let efd = create_blocking_eventfd()?;
-    println!("Attempting to read from eventfd...");
-
-    let mut buffer = [0u8; 8]; // eventfd 读取需要 8 字节的缓冲区
-    // 尝试从 eventfd 读取数据，由于没有数据写入，这将阻塞
-    let result = unsafe { read(efd, buffer.as_mut_ptr() as *mut _, 8) };
-
-    // 读取结果检查
-    match result {
-        n if n < 0 => {
-            eprintln!("Read failed: {:?}", io::Error::last_os_error());
-        }
-        _ => println!("Data read from eventfd."),
-    }
-
-    Ok(())
-}
-
-// use std::io::{self, Read, Write};
-// use std::os::unix::io::AsRawFd;
-// use std::os::unix::net::UnixStream;
+// fn create_blocking_eventfd() -> io::Result<RawFd> {
+//     // 创建一个阻塞的 eventfd，初始计数器值为 0
+//     let efd = unsafe { eventfd(0, 0) };
+//     if efd < 0 {
+//         Err(io::Error::last_os_error())
+//     } else {
+//         Ok(efd)
+//     }
+// }
 
 // fn main() -> io::Result<()> {
-//     // 创建一个阻塞的 Unix 管道
-//     let (mut reader, mut writer) = UnixStream::pair()?;
+//     // 创建阻塞的 eventfd
+//     let efd = create_blocking_eventfd()?;
+//     println!("Attempting to read from eventfd...");
 
-//     println!("Attempting to read from the pipe (this will block since no data is written)...");
+//     let mut buffer = [0u8; 8]; // eventfd 读取需要 8 字节的缓冲区
+//     // 尝试从 eventfd 读取数据，由于没有数据写入，这将阻塞
+//     let result = unsafe { read(efd, buffer.as_mut_ptr() as *mut _, 8) };
 
-//     // 读取缓冲区
-//     let mut buffer = [0u8; 1024];
-
-//     // 尝试读取数据，由于没有数据写入，这将会阻塞
-//     match reader.read(&mut buffer) {
-//         Ok(n) => println!("Read {} bytes from pipe.", n),
-//         Err(e) => eprintln!("Failed to read from pipe: {:?}", e),
+//     // 读取结果检查
+//     match result {
+//         n if n < 0 => {
+//             eprintln!("Read failed: {:?}", io::Error::last_os_error());
+//         }
+//         _ => println!("Data read from eventfd."),
 //     }
 
 //     Ok(())
 // }
+
+use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+
+fn main() -> io::Result<()> {
+    // 创建一个阻塞的 Unix 管道
+    let (mut reader, mut writer) = UnixStream::pair()?;
+
+    println!("Attempting to read from the pipe (this will block since no data is written)...");
+
+    // 读取缓冲区
+    let mut buffer = [0u8; 1024];
+
+    // 尝试读取数据，由于没有数据写入，这将会阻塞
+    match reader.read(&mut buffer) {
+        Ok(n) => println!("Read {} bytes from pipe.", n),
+        Err(e) => eprintln!("Failed to read from pipe: {:?}", e),
+    }
+
+    Ok(())
+}

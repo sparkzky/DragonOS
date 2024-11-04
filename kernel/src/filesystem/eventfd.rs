@@ -116,24 +116,41 @@ impl IndexNode for EventFdInode {
         if len < 8 {
             return Err(SystemError::EINVAL);
         }
-        let mut val = loop {
-            let val = self.eventfd.lock().count;
-            if val != 0 {
-                break val;
-            }
-            if self
-                .eventfd
-                .lock()
-                .flags
-                .contains(EventFdFlags::EFD_NONBLOCK)
-            {
+        let mut lock_efd = self.eventfd.lock();
+        while lock_efd.count == 0 {
+            if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                drop(lock_efd);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
+
+            drop(lock_efd);
             let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
             if r.is_err() {
                 return Err(SystemError::ERESTARTSYS);
             }
-        };
+
+            lock_efd = self.eventfd.lock();
+        }
+        let mut val = lock_efd.count;
+
+        // let mut val = loop {
+        //     let val = self.eventfd.lock().count;
+        //     if val != 0 {
+        //         break val;
+        //     }
+        //     if self
+        //         .eventfd
+        //         .lock()
+        //         .flags
+        //         .contains(EventFdFlags::EFD_NONBLOCK)
+        //     {
+        //         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        //     }
+        //     let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
+        //     if r.is_err() {
+        //         return Err(SystemError::ERESTARTSYS);
+        //     }
+        // };
 
         let mut eventfd = self.eventfd.lock();
         if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
