@@ -3,6 +3,6 @@ Description=Shell
 
 [Service]
 Type=simple
-ExecStart=/bin/NovaShell
+ExecStart=/bin/busybox sh
 Restart=always
 ExecStartPre=-/bin/about.elf
