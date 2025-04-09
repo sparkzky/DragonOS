@@ -200,6 +200,14 @@ impl ProcessManager {
             )
         });
 
+        let pgid = pcb.pgid();
+        let sid = pcb.sid();
+        log::debug!(
+            "fork: New process created, pid: {:?}, pgid: {:?}, sid: {:?}",
+            pcb.pid(),
+            pgid,
+            sid
+        );
         return Ok(pcb.pid());
     }
 

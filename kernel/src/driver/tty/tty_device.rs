@@ -173,6 +173,12 @@ impl IndexNode for TtyDevice {
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
             let pcb = ProcessManager::current_pcb();
+            log::debug!(
+                "Open: current pid: {}, pgid: {}, sid: {}",
+                pcb.pid(),
+                pcb.pgid(),
+                pcb.sid()
+            );
             let pcb_tty = pcb.sig_info_irqsave().tty();
             if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
                 TtyJobCtrlManager::proc_set_tty(tty);
@@ -189,6 +195,7 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
+        log::debug!("tty_device read_at");
         let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.mode)
         } else {
@@ -596,6 +603,7 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
+    log::debug!("tty_init");
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(

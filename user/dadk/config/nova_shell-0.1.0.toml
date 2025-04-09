@@ -21,10 +21,10 @@ type = "build-from-source"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "git"
 # 路径或URL
-source-path = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/NovaShell.git"
+source-path = "https://github.com/sparkzky/NovaShell.git"
 # git标签或分支
 # 注意： branch和revision只能二选一，且source要设置为"git"
-revision = "d7d2136c5a"
+revision = "dd8fc4b5b3eb874a846d1cfd3b16a6cae50a0ba8"
 # 构建相关信息
 [build]
 # （可选）构建命令

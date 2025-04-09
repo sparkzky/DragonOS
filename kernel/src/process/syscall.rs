@@ -155,6 +155,7 @@ impl Syscall {
         envp: Vec<CString>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
+        log::debug!("execve path: {:?}, argv: {:?}, envp: {:?}", path, argv, envp);
         let address_space = AddressSpace::new(true).expect("Failed to create new address space");
         // debug!("to load binary file");
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
@@ -267,6 +268,7 @@ impl Syscall {
             return Ok(current_pcb.pgid());
         }
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        log::debug!("getpgid: pid: {:?}, pgid: {:?}", pid, target_proc.pgid());
         return Ok(target_proc.pgid());
     }
 
@@ -300,12 +302,14 @@ impl Syscall {
         }
         let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
         pcb.join_other_group(pgid)?;
+        log::debug!("After setpgid: pid: {:?}, pgid: {:?}", pid, pgid);
 
         return Ok(0);
     }
 
     /// 创建新的会话
     pub fn setsid() -> Result<usize, SystemError> {
+        log::debug!("setsid");
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
         Ok(session.sid().into())

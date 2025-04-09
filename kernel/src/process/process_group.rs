@@ -1,5 +1,8 @@
-use super::{session::Session, Pid, ProcessControlBlock, ProcessManager};
-use crate::libs::{mutex::Mutex, spinlock::SpinLock};
+use super::{
+    session::{Session, Sid},
+    Pid, ProcessControlBlock, ProcessManager,
+};
+use crate::libs::spinlock::SpinLock;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -25,7 +28,7 @@ pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>>
 pub struct ProcessGroup {
     /// 进程组pgid
     pub pgid: Pgid,
-    pub process_group_inner: Mutex<PGInner>,
+    pub process_group_inner: SpinLock<PGInner>,
 }
 
 #[derive(Debug)]
@@ -64,7 +67,7 @@ impl ProcessGroup {
 
         Arc::new(Self {
             pgid: pid,
-            process_group_inner: Mutex::new(inner),
+            process_group_inner: SpinLock::new(inner),
         })
     }
 
@@ -92,6 +95,13 @@ impl ProcessGroup {
 
     pub fn broadcast(&self) {
         unimplemented!("broadcast not supported yet");
+    }
+
+    pub fn sid(&self) -> Sid {
+        if let Some(session) = self.session() {
+            return session.sid();
+        }
+        Sid::from(0)
     }
 }
 
@@ -167,6 +177,28 @@ impl ProcessManager {
                 drop(pg);
             }
         }
+    }
+
+    pub fn is_current_pgrp_orphaned() -> bool {
+        let current_pcb = ProcessManager::current_pcb();
+        let sid = current_pcb.sid();
+        let process_group = current_pcb.process_group();
+        if let Some(pg) = process_group {
+            for process in pg.process_group_inner.lock().processes.values() {
+                if let Some(real_parent) = process.real_parent_pcb.read().clone().upgrade() {
+                    //todo 添加判断： 1.是否被忽略 2.是否已经退出（线程组是否为空）
+                    if real_parent.pid == Pid(1) || process.is_exited() {
+                        continue;
+                    }
+                    let real_parent_pg = real_parent.process_group().unwrap();
+                    if real_parent_pg.pgid() != pg.pgid() && real_parent_pg.sid() == sid {
+                        return false;
+                    }
+                }
+            }
+        }
+        log::debug!("iscurrent_pgrp_orphaned end");
+        true
     }
 }
 

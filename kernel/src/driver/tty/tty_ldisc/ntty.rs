@@ -1585,6 +1585,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         _offset: usize,
         mode: FileMode,
     ) -> Result<usize, system_error::SystemError> {
+        // log::debug!("ldsc read: read tty len: {}", len);
         let mut ldata;
         if mode.contains(FileMode::O_NONBLOCK) {
             let ret = self.disc_data_try_lock();
@@ -1626,6 +1627,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         drop(termios);
 
         TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTIN)?;
+        // log::debug!("after tty_check_change");
 
         let mut minimum: usize = 0;
         if !ldata.icanon {
