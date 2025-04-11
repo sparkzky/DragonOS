@@ -217,6 +217,6 @@ impl ProcessControlBlock {
         if let Some(session) = self.session() {
             return session.sid();
         }
-        return Sid::new(0);
+        return Sid::new(1);
     }
 }
