@@ -126,6 +126,7 @@ impl Syscall {
         let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
+        //?
         let ret = sig
             .send_signal_info(Some(&mut info), pid)
             .map(|x| x as usize);

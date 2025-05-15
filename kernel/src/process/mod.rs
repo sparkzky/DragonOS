@@ -404,6 +404,11 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `exit_code` : 进程的退出码
+    ///
+    /// ## 注意
+    ///  对于正常退出的进程，状态码应该是写在高八位，以便正常返回退出码；而对于被信号终止的进程，状态码则是低七位。
+    ///
+    ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -456,6 +461,7 @@ impl ProcessManager {
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
+                //todo
                 // 临时解决方案！！！ 临时解决方案！！！ 引入进程组之后，要重写这个更新前台进程组的逻辑
                 let mut g = tty.core().contorl_info_irqsave();
                 if g.pgid == Some(pid) {
