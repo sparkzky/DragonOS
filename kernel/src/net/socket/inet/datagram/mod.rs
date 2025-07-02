@@ -135,6 +135,7 @@ impl UdpSocket {
     }
 
     pub fn event(&self) -> EPollEventType {
+        // log::info!("UdpSocket::event");
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Unbound(_) => {
