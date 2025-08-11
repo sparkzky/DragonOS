@@ -1,3 +1,5 @@
+pub(super) mod datagram_common;
+
 use crate::net::socket;
 use alloc::sync::Arc;
 use socket::Family;
@@ -15,6 +17,7 @@ pub fn create_socket(
         AF::INet => socket::inet::Inet::socket(socket_type, protocol)?,
         // AF::INet6 => socket::inet::Inet6::socket(socket_type, protocol)?,
         AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
+        AF::Netlink => socket::netlink::Netlink::socket(socket_type, protocol)?,
         _ => {
             log::warn!("unsupport address family");
             return Err(SystemError::EAFNOSUPPORT);

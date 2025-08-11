@@ -1,4 +1,7 @@
-use crate::{filesystem::vfs::InodeId, net::socket};
+use crate::{
+    filesystem::vfs::InodeId,
+    net::socket::{self, netlink::addr::NetlinkSocketAddr},
+};
 use alloc::{string::String, sync::Arc};
 
 pub use smoltcp::wire::IpEndpoint;
@@ -17,6 +20,8 @@ pub enum Endpoint {
     Unixpath((InodeId, String)),
     /// Unix抽象端点
     Abspath((AbsHandle, String)),
+    /// Netlink端点
+    Netlink(NetlinkSocketAddr),
 }
 
 /// @brief 链路层端点

@@ -5,6 +5,7 @@ pub mod endpoint;
 mod family;
 pub mod inet;
 mod inode;
+pub mod netlink;
 mod posix;
 pub mod unix;
 mod utils;
