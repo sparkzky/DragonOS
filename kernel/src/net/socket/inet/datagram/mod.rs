@@ -5,6 +5,8 @@ use system_error::SystemError;
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::{Socket, PMSG};
+use crate::process::namespace::net_namespace::NetNamespace;
+use crate::process::ProcessManager;
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicBool;
@@ -22,16 +24,19 @@ pub struct UdpSocket {
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     self_ref: Weak<UdpSocket>,
+    netns: Arc<NetNamespace>,
 }
 
 impl UdpSocket {
     pub fn new(nonblock: bool) -> Arc<Self> {
-        return Arc::new_cyclic(|me| Self {
+        let netns = ProcessManager::current_netns();
+        Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
-        });
+            netns,
+        })
     }
 
     pub fn is_nonblock(&self) -> bool {
@@ -41,7 +46,7 @@ impl UdpSocket {
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
-            let bound = unbound.bind(local_endpoint)?;
+            let bound = unbound.bind(local_endpoint, self.netns())?;
 
             bound
                 .inner()
@@ -58,7 +63,7 @@ impl UdpSocket {
         let mut inner_guard = self.inner.write();
         let bound = match inner_guard.take().expect("Udp inner is None") {
             UdpInner::Bound(inner) => inner,
-            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote)?,
+            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote, self.netns())?,
         };
         inner_guard.replace(UdpInner::Bound(bound));
         return Ok(());
@@ -115,9 +120,8 @@ impl UdpSocket {
             let mut inner_guard = self.inner.write();
             let inner = match inner_guard.take().expect("Udp Inner is None") {
                 UdpInner::Bound(bound) => bound,
-                UdpInner::Unbound(unbound) => {
-                    unbound.bind_ephemeral(to.ok_or(SystemError::EADDRNOTAVAIL)?.addr)?
-                }
+                UdpInner::Unbound(unbound) => unbound
+                    .bind_ephemeral(to.ok_or(SystemError::EADDRNOTAVAIL)?.addr, self.netns())?,
             };
             // size = inner.try_send(buf, to)?;
             inner_guard.replace(UdpInner::Bound(inner));
@@ -171,6 +175,10 @@ impl UdpSocket {
             rem.poll_blocking(&can_recv);
         }
         let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+    }
+
+    pub fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
     }
 }
 

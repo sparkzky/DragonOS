@@ -6,6 +6,8 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::shutdown::{ShutdownBit, ShutdownTemp};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{Socket, SocketInode, PMSG, PSOL};
+use crate::process::namespace::net_namespace::NetNamespace;
+use crate::process::ProcessManager;
 use crate::sched::SchedMode;
 use crate::{libs::rwlock::RwLock, net::socket::common::shutdown::Shutdown};
 use smoltcp;
@@ -27,10 +29,12 @@ pub struct TcpSocket {
     wait_queue: WaitQueue,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
+    netns: Arc<NetNamespace>,
 }
 
 impl TcpSocket {
     pub fn new(_nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
+        let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
             shutdown: Shutdown::new(),
@@ -38,10 +42,15 @@ impl TcpSocket {
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
+            netns,
         })
     }
 
-    pub fn new_established(inner: inner::Established, nonblock: bool) -> Arc<Self> {
+    pub fn new_established(
+        inner: inner::Established,
+        nonblock: bool,
+        netns: Arc<NetNamespace>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Established(inner))),
             shutdown: Shutdown::new(),
@@ -49,6 +58,7 @@ impl TcpSocket {
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
+            netns,
         })
     }
 
@@ -60,7 +70,7 @@ impl TcpSocket {
         let mut writer = self.inner.write();
         match writer.take().expect("Tcp inner::Inner is None") {
             inner::Inner::Init(inner) => {
-                let bound = inner.bind(local_endpoint)?;
+                let bound = inner.bind(local_endpoint, self.netns())?;
                 if let inner::Init::Bound((ref bound, _)) = bound {
                     bound
                         .iface()
@@ -109,7 +119,7 @@ impl TcpSocket {
         {
             inner::Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
                 (
-                    TcpSocket::new_established(stream, self.is_nonblock()),
+                    TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
                     remote,
                 )
             }),
@@ -126,7 +136,7 @@ impl TcpSocket {
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {
             inner::Inner::Init(init) => {
-                let conn_result = init.connect(remote_endpoint);
+                let conn_result = init.connect(remote_endpoint, self.netns());
                 match conn_result {
                     Ok(connecting) => (
                         inner::Inner::Connecting(connecting),
@@ -251,6 +261,10 @@ impl TcpSocket {
 
     fn incoming(&self) -> bool {
         EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
+    }
+
+    pub fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
     }
 }
 
