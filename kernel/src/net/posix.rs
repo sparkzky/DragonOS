@@ -42,7 +42,10 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     mm::{verify_area, VirtAddr},
-    net::socket::unix::ns::abs::{alloc_abs_addr, look_up_abs_addr},
+    net::socket::{
+        netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr},
+        unix::ns::abs::{alloc_abs_addr, look_up_abs_addr},
+    },
     process::ProcessManager,
 };
 
@@ -203,6 +206,21 @@ impl SockAddr {
                         inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
                     return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
+                }
+                AddressFamily::Netlink => {
+                    if len < addr.len()? {
+                        log::error!("len < addr.len() for Netlink");
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    let addr_nl: SockAddrNl = addr.addr_nl;
+                    let nl_pid = addr_nl.nl_pid;
+                    let nl_groups = addr_nl.nl_groups;
+
+                    Ok(Endpoint::Netlink(NetlinkSocketAddr::new(
+                        nl_pid,
+                        GroupIdSet::new(nl_groups),
+                    )))
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);
