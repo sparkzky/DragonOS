@@ -296,7 +296,7 @@ impl From<Endpoint> for SockAddr {
                     let addr_in = SockAddrIn {
                         sin_family: AddressFamily::INet as u16,
                         sin_port: ip_endpoint.port.to_be(),
-                        sin_addr: ipv4_addr.to_bits(),
+                        sin_addr: ipv4_addr.to_bits().to_be(),
                         sin_zero: [0; 8],
                     };
 
