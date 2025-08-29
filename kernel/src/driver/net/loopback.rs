@@ -328,7 +328,6 @@ impl LoopbackInterface {
                 iface_id,
                 super::types::InterfaceType::LOOPBACK,
                 flags,
-                false,
                 iface,
             ),
             inner: SpinLock::new(InnerLoopbackInterface {
