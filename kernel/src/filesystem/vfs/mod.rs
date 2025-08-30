@@ -660,7 +660,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// # 将当前Inode转换为Socket类型
     /// 如果当前Inode不是Socket类型，则返回None
-    /// 
+    ///
     /// # 注意
     /// 这个方法已经为dyn Socket实现，
     /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换

@@ -241,6 +241,7 @@ impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    #[allow(unused)]
     pub fn set_nonblocking(&self, nonblocking: bool) {
         self.is_nonblocking
             .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
@@ -249,6 +250,7 @@ impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
 
 // 多播消息的时候会用到，比如uevent
 impl<P: SupportedNetlinkProtocol> Inner<UnboundNetlink<P>, BoundNetlink<P::Message>> {
+    #[allow(unused)]
     fn add_groups(&mut self, groups: GroupIdSet) {
         match self {
             Inner::Bound(bound) => bound.add_groups(groups),
@@ -256,6 +258,7 @@ impl<P: SupportedNetlinkProtocol> Inner<UnboundNetlink<P>, BoundNetlink<P::Messa
         }
     }
 
+    #[allow(unused)]
     fn drop_groups(&mut self, groups: GroupIdSet) {
         match self {
             Inner::Unbound(unbound) => unbound.drop_groups(groups),
