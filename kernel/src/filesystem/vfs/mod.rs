@@ -26,6 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    net::socket::Socket,
     process::ProcessManager,
     time::PosixTimeSpec,
 };
@@ -655,6 +656,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// If the inode is not pollable, return an error
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    /// # 将当前Inode转换为Socket类型
+    /// 如果当前Inode不是Socket类型，则返回None
+    /// 
+    /// # 注意
+    /// 这个方法已经为dyn Socket实现，
+    /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        None
     }
 }
 

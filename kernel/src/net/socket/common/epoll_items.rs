@@ -1,25 +1,25 @@
 use alloc::{
-    collections::LinkedList,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    filesystem::epoll::{event_poll::EventPoll, EPollItem},
+    filesystem::epoll::{
+        event_poll::{EventPoll, LockedEPItemLinkedList},
+        EPollItem,
+    },
     libs::spinlock::SpinLock,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct EPollItems {
-    items: Arc<SpinLock<LinkedList<Arc<EPollItem>>>>,
+    items: LockedEPItemLinkedList,
 }
 
-impl Default for EPollItems {
-    fn default() -> Self {
-        Self {
-            items: Arc::new(SpinLock::new(LinkedList::new())),
-        }
+impl AsRef<LockedEPItemLinkedList> for EPollItems {
+    fn as_ref(&self) -> &LockedEPItemLinkedList {
+        &self.items
     }
 }
 

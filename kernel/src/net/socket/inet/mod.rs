@@ -18,7 +18,9 @@ use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv6Address;
 
 pub use stream::TcpSocket;
-pub use syscall::Inet;
+// pub use syscall::Inet;
+
+use crate::filesystem::epoll::event_poll::EventPoll;
 
 use super::Socket;
 
@@ -36,4 +38,9 @@ pub trait InetSocket: Socket {
     /// `on_iface_events`
     /// 通知socket发生的事件
     fn on_iface_events(&self);
+
+    fn notify(&self) {
+        self.on_iface_events();
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+    }
 }

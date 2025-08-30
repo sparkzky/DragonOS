@@ -1,30 +1,35 @@
-use crate::filesystem::vfs::IndexNode;
-use alloc::sync::Arc;
+use crate::{
+    filesystem::vfs::{
+        syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata, PollableInode,
+    },
+    libs::spinlock::SpinLockGuard,
+};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use super::{
-    common::shutdown::ShutdownTemp,
-    endpoint::Endpoint,
-    posix::{PMSG, PSOL},
-    EPollItems, Socket,
-};
+use super::Socket;
 
-#[derive(Debug)]
-pub struct SocketInode {
-    inner: Arc<dyn Socket>,
-    epoll_items: EPollItems,
-}
+impl<T: Socket + 'static> IndexNode for T {
+    fn open(
+        &self,
+        _: SpinLockGuard<FilePrivateData>,
+        _: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
 
-impl IndexNode for SocketInode {
+    fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        self.do_close()
+    }
+
     fn read_at(
         &self,
-        _offset: usize,
-        _len: usize,
+        _: usize,
+        _: usize,
         buf: &mut [u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        drop(data);
-        self.inner.read(buf)
+        self.read(buf)
     }
 
     fn write_at(
@@ -32,156 +37,64 @@ impl IndexNode for SocketInode {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        drop(data);
-        self.inner.write(buf)
+        self.write(buf)
     }
 
-    /* Following are not yet available in socket */
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        log::warn!("wtf logic we need to consider resize of socket? why would trigger it");
+        Ok(())
+    }
+
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        unreachable!("Socket does not have a file system")
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
-    /* filesystem associate interfaces are about unix and netlink socket */
-    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        unimplemented!()
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        Err(SystemError::ENOTDIR)
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        unimplemented!()
-    }
-
-    fn open(
-        &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        let meta = crate::filesystem::vfs::Metadata {
-            mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
-            file_type: crate::filesystem::vfs::FileType::Socket,
-            size: self.send_buffer_size() as i64,
-            ..Default::default()
-        };
-
-        return Ok(meta);
+        Ok(Metadata::new(
+            FileType::Socket,
+            ModeType::from_bits_truncate(0o755),
+        ))
     }
 
-    fn close(
-        &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        self.inner.close()
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        Some(self)
     }
 }
 
-impl SocketInode {
-    // pub fn wait_queue(&self) -> WaitQueue {
-    //     self.inner.wait_queue()
-    // }
-
-    pub fn send_buffer_size(&self) -> usize {
-        self.inner.send_buffer_size()
+impl<T: Socket + 'static> PollableInode for T {
+    fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
+        Ok(self.check_io_event().bits() as usize)
     }
 
-    pub fn recv_buffer_size(&self) -> usize {
-        self.inner.recv_buffer_size()
-    }
-
-    pub fn accept(&self) -> Result<(Arc<Self>, Endpoint), SystemError> {
-        self.inner.accept()
-    }
-
-    pub fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        self.inner.bind(endpoint)
-    }
-
-    pub fn set_option(&self, level: PSOL, name: usize, value: &[u8]) -> Result<(), SystemError> {
-        self.inner.set_option(level, name, value)
-    }
-
-    pub fn get_option(
+    fn add_epitem(
         &self,
-        level: PSOL,
-        name: usize,
-        value: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        self.inner.get_option(level, name, value)
+        epitem: Arc<crate::filesystem::epoll::EPollItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.epoll_items().add(epitem);
+        return Ok(());
     }
 
-    pub fn listen(&self, backlog: usize) -> Result<(), SystemError> {
-        self.inner.listen(backlog)
-    }
-
-    pub fn send_to(
+    fn remove_epitem(
         &self,
-        buffer: &[u8],
-        address: Endpoint,
-        flags: PMSG,
-    ) -> Result<usize, SystemError> {
-        self.inner.send_to(buffer, flags, address)
-    }
-
-    pub fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
-        self.inner.send(buffer, flags)
-    }
-
-    pub fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        self.inner.recv(buffer, flags)
-    }
-
-    // TODO receive from split with endpoint or not
-    pub fn recv_from(
-        &self,
-        buffer: &mut [u8],
-        flags: PMSG,
-        address: Option<Endpoint>,
-    ) -> Result<(usize, Endpoint), SystemError> {
-        self.inner.recv_from(buffer, flags, address)
-    }
-
-    pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
-        self.inner.shutdown(how)
-    }
-
-    pub fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        self.inner.connect(endpoint)
-    }
-
-    pub fn get_name(&self) -> Result<Endpoint, SystemError> {
-        self.inner.get_name()
-    }
-
-    pub fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
-        self.inner.get_peer_name()
-    }
-
-    pub fn new(inner: Arc<dyn Socket>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            epoll_items: EPollItems::default(),
-        })
-    }
-
-    /// # `epoll_items`
-    /// socket的epoll事件集
-    pub fn epoll_items(&self) -> EPollItems {
-        self.epoll_items.clone()
-    }
-
-    pub fn set_nonblock(&self, _nonblock: bool) {
-        log::warn!("nonblock is not support yet");
-    }
-
-    pub fn set_close_on_exec(&self, _close_on_exec: bool) {
-        log::warn!("close_on_exec is not support yet");
-    }
-
-    pub fn inner(&self) -> Arc<dyn Socket> {
-        return self.inner.clone();
+        epitm: &Arc<crate::filesystem::epoll::EPollItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let _ = self.epoll_items().remove(&epitm.epoll());
+        return Ok(());
     }
 }

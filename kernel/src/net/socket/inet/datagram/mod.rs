@@ -4,6 +4,7 @@ use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::EPollItems;
 use crate::net::socket::{Socket, PMSG};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -18,12 +19,14 @@ pub mod inner;
 type EP = crate::filesystem::epoll::EPollEventType;
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
+#[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     self_ref: Weak<UdpSocket>,
+    epoll_items: EPollItems,
     netns: Arc<NetNamespace>,
 }
 
@@ -35,6 +38,7 @@ impl UdpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
+            epoll_items: EPollItems::default(),
             netns,
         })
     }
@@ -102,13 +106,13 @@ impl UdpSocket {
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.event().contains(EP::EPOLLIN)
+        self.check_io_event().contains(EP::EPOLLIN)
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn can_send(&self) -> bool {
-        self.event().contains(EP::EPOLLOUT)
+        self.check_io_event().contains(EP::EPOLLOUT)
     }
 
     pub fn try_send(
@@ -138,29 +142,6 @@ impl UdpSocket {
         return result;
     }
 
-    pub fn event(&self) -> EPollEventType {
-        // log::info!("UdpSocket::event");
-        let mut event = EPollEventType::empty();
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Unbound(_) => {
-                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-            }
-            UdpInner::Bound(bound) => {
-                let (can_recv, can_send) =
-                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
-
-                if can_recv {
-                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
-                }
-
-                if can_send {
-                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-                }
-            }
-        }
-        return event;
-    }
-
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
     }
@@ -169,10 +150,6 @@ impl UdpSocket {
 impl Socket for UdpSocket {
     fn wait_queue(&self) -> &WaitQueue {
         &self.wait_queue
-    }
-
-    fn poll(&self) -> usize {
-        self.event().bits() as usize
     }
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
@@ -278,9 +255,59 @@ impl Socket for UdpSocket {
         .map(|(len, remote)| (len, Endpoint::Ip(remote)));
     }
 
-    fn close(&self) -> Result<(), SystemError> {
+    fn do_close(&self) -> Result<(), SystemError> {
         self.close();
         Ok(())
+    }
+
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
+        todo!()
+    }
+
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
+        todo!()
+    }
+
+    fn recv_msg(
+        &self,
+        _msg: &mut crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn send_msg(
+        &self,
+        _msg: &crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
+        &self.epoll_items
+    }
+
+    fn check_io_event(&self) -> EPollEventType {
+        let mut event = EPollEventType::empty();
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Unbound(_) => {
+                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+            }
+            UdpInner::Bound(bound) => {
+                let (can_recv, can_send) =
+                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
+
+                if can_recv {
+                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
+                }
+
+                if can_send {
+                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                }
+            }
+        }
+        return event;
     }
 }
 
