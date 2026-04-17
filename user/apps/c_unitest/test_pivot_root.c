@@ -853,6 +853,97 @@ static void test_current_root_not_mountpoint(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  TEST 12 – calling task keeps chroot root if it wasn't old root    */
+/* ------------------------------------------------------------------ */
+
+static int child_chrooted_caller_root_preserved(void *arg)
+{
+    (void)arg;
+
+    if (make_rprivate() != 0) return 1;
+
+    mkdir("/tmp/pv_self_keep", 0755);
+    mkdir("/tmp/pv_self_keep/chroot_root", 0755);
+
+    if (mount("tmpfs", "/tmp/pv_self_keep/chroot_root", "tmpfs", 0, NULL) != 0) {
+        perror("mount chroot_root");
+        return 1;
+    }
+
+    mkdir("/tmp/pv_self_keep/chroot_root/new_root", 0755);
+    if (mount("tmpfs", "/tmp/pv_self_keep/chroot_root/new_root", "tmpfs", 0, NULL) != 0) {
+        perror("mount new_root");
+        return 1;
+    }
+
+    mkdir("/tmp/pv_self_keep/chroot_root/new_root/old_root", 0755);
+
+    int fd = open("/tmp/pv_self_keep/chroot_root/marker", O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) {
+        perror("open marker");
+        return 1;
+    }
+    if (write(fd, "caller_root", 11) != 11) {
+        perror("write marker");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+
+    if (chroot("/tmp/pv_self_keep/chroot_root") != 0) {
+        perror("chroot");
+        return 1;
+    }
+    if (chdir("/") != 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    if (do_pivot_root("/new_root", "/new_root/old_root") != 0) {
+        fprintf(stderr, "pivot_root failed: %s\n", strerror(errno));
+        return 2;
+    }
+
+    /*
+     * The caller's fs root did not point at the old namespace root, so Linux
+     * keeps the chroot view unchanged after a successful pivot_root.
+     */
+    struct stat st;
+    if (stat("/marker", &st) != 0) {
+        fprintf(stderr, "marker disappeared after pivot_root\n");
+        return 3;
+    }
+
+    if (stat("/new_root", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "new_root is no longer visible from preserved root\n");
+        return 4;
+    }
+
+    if (stat("/old_root", &st) == 0) {
+        fprintf(stderr, "caller unexpectedly switched to new root view\n");
+        return 5;
+    }
+
+    return 0;
+}
+
+static void test_chrooted_caller_root_preserved(void)
+{
+    printf("\n--- Test 12: chrooted caller root preserved across pivot_root ---\n");
+    int rc = run_in_new_mntns(child_chrooted_caller_root_preserved, NULL);
+    if (rc == 0) {
+        TEST_PASS("calling task keeps its chroot root when it was not old root");
+    } else if (rc == 2) {
+        TEST_SKIP("chrooted caller root preserved",
+                  "pivot_root itself failed, cannot verify caller root preservation");
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "child exited %d", rc);
+        TEST_FAIL("chrooted caller root preserved", buf);
+    }
+}
+
 /* ================================================================== */
 /*  main                                                               */
 /* ================================================================== */
@@ -876,6 +967,7 @@ int main(void)
     test_double_pivot();             /* Test 9 – double pivot    */
     test_new_root_not_below();       /* Test 10 – new_root check */
     test_current_root_not_mountpoint(); /* Test 11 – current root check */
+    test_chrooted_caller_root_preserved(); /* Test 12 – caller root keep */
 
     printf("\n=== Summary ===\n");
     printf("  Passed:  %d\n", tests_passed);

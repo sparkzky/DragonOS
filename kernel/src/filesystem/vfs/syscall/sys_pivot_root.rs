@@ -243,7 +243,7 @@ fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool 
 
 fn repair_same_namespace_fs_refs(
     target_mntns: &Arc<crate::process::namespace::mnt::MntNamespace>,
-    current_task: &Arc<ProcessControlBlock>,
+    _current_task: &Arc<ProcessControlBlock>,
     old_root_inode: &Arc<dyn IndexNode>,
     new_root_inode: &Arc<dyn IndexNode>,
     old_new_root_path: &str,
@@ -262,10 +262,9 @@ fn repair_same_namespace_fs_refs(
         }
 
         let fs = task.fs_struct();
-        let is_current_task = Arc::ptr_eq(&task, current_task);
         let root_replaced = same_path_ref(&fs.root(), old_root_inode);
         let pwd_replaced = same_path_ref(&fs.pwd(), old_root_inode);
-        let rewrite_cwd = is_current_task || root_replaced || pwd_replaced;
+        let rewrite_cwd = root_replaced || pwd_replaced;
 
         if !root_replaced && !pwd_replaced && !rewrite_cwd {
             continue;
@@ -275,7 +274,7 @@ fn repair_same_namespace_fs_refs(
         let mut basic = task.basic_mut();
         let fs_guard = task.fs_struct_mut();
 
-        if root_replaced || is_current_task {
+        if root_replaced {
             fs_guard.set_root(new_root_inode.clone());
         }
         if pwd_replaced {
