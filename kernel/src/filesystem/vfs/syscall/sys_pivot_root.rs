@@ -111,8 +111,7 @@ fn resolve_pivot_root_targets(
     }
 
     let current_mntns = ProcessManager::current_mntns();
-    let namespace_root_inode = current_mntns.root_inode();
-    let current_root_inode = namespace_root_inode.clone();
+    let current_root_inode = current_pcb.fs_struct().root();
 
     let (new_root_begin, new_root_rest) = user_path_at(
         &current_pcb,
@@ -138,6 +137,12 @@ fn resolve_pivot_root_targets(
     let put_old_mountpoint = inode_as_mountpoint(&put_old_inode)?;
     let new_root_mntfs = new_root_mountpoint.mount_fs();
     let put_old_mntfs = put_old_mountpoint.mount_fs();
+
+    // Linux requires the caller's current root (which may differ from the
+    // mount namespace root after chroot(2)) to be the root of a mount.
+    if !is_mount_root(&current_root_inode)? {
+        return Err(SystemError::EINVAL);
+    }
 
     if same_path_ref(&new_root_inode, &current_root_inode)
         || same_path_ref(&put_old_inode, &current_root_inode)

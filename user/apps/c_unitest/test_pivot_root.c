@@ -786,6 +786,73 @@ static void test_new_root_not_below(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  TEST 11 – current root must itself be a mountpoint → EINVAL       */
+/*  (matches gVisor CurrentRootNotAMountPoint semantics)              */
+/* ------------------------------------------------------------------ */
+
+static int child_current_root_not_mountpoint(void *arg)
+{
+    (void)arg;
+
+    if (make_rprivate() != 0) {
+        perror("make_rprivate");
+        return 1;
+    }
+
+    mkdir("/tmp/pv_cur_root", 0755);
+    mkdir("/tmp/pv_cur_root/tree", 0755);
+    mkdir("/tmp/pv_cur_root/tree/new_root", 0755);
+
+    if (mount("tmpfs", "/tmp/pv_cur_root/tree/new_root", "tmpfs", 0, NULL) != 0) {
+        perror("mount tmpfs");
+        return 1;
+    }
+
+    mkdir("/tmp/pv_cur_root/tree/new_root/old_root", 0755);
+
+    /*
+     * The process root becomes /tmp/pv_cur_root/tree, which is not a mountpoint.
+     * Even though /new_root is a mount root beneath it, pivot_root must fail.
+     */
+    if (chroot("/tmp/pv_cur_root/tree") != 0) {
+        perror("chroot");
+        return 1;
+    }
+
+    if (chdir("/new_root") != 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    if (do_pivot_root(".", "old_root") == -1 && errno == EINVAL) {
+        return 0;
+    }
+
+    if (errno != 0) {
+        fprintf(stderr, "pivot_root errno=%d (%s)\n", errno, strerror(errno));
+    } else {
+        fprintf(stderr, "pivot_root unexpectedly succeeded\n");
+    }
+    return 2;
+}
+
+static void test_current_root_not_mountpoint(void)
+{
+    printf("\n--- Test 11: current root not a mountpoint → EINVAL ---\n");
+    int rc = run_in_new_mntns(child_current_root_not_mountpoint, NULL);
+    if (rc == 0) {
+        TEST_PASS("pivot_root rejects current root that is not a mountpoint");
+    } else if (rc == 2) {
+        TEST_FAIL("current root not a mountpoint",
+                  "pivot_root succeeded or returned the wrong errno");
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "child exited %d", rc);
+        TEST_FAIL("current root not a mountpoint", buf);
+    }
+}
+
 /* ================================================================== */
 /*  main                                                               */
 /* ================================================================== */
@@ -808,6 +875,7 @@ int main(void)
     test_race();                     /* Test 8 – BUG-8           */
     test_double_pivot();             /* Test 9 – double pivot    */
     test_new_root_not_below();       /* Test 10 – new_root check */
+    test_current_root_not_mountpoint(); /* Test 11 – current root check */
 
     printf("\n=== Summary ===\n");
     printf("  Passed:  %d\n", tests_passed);
