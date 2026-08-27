@@ -353,6 +353,10 @@ impl ExecParam {
         // slot lease cannot survive into the new image.
         #[cfg(target_arch = "x86_64")]
         crate::exception::uprobe::cleanup_task_active_xol(&me);
+        // The uretprobe return-instance chain is likewise bound to the old
+        // user context: drop it without delivering return callbacks.
+        #[cfg(target_arch = "x86_64")]
+        crate::process::uprobe::cleanup_task_uret_instances(&me);
 
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 

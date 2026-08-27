@@ -132,6 +132,8 @@ pub use inner::InnerAddressSpace;
 pub use mapper::UserMapper;
 pub use stack::UserStack;
 #[cfg(target_arch = "x86_64")]
+pub(crate) use uprobe::UprobeParticipantNode;
+#[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use uprobe::{
     fork_inherit_uprobes, uprobe_apply_to_new_vma, uprobe_new_consumer_id, uprobe_registry_add,

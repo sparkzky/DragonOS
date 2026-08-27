@@ -21,10 +21,14 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::Signal;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
-use crate::ipc::signal::force_sig_fault_to_current;
+use crate::ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current};
+use crate::mm::ucontext::UprobeParticipantNode;
 use crate::mm::VirtAddr;
-use crate::process::uprobe::{ActiveXol, TaskXolPhase};
+use crate::process::uprobe::{
+    ActiveXol, ReturnInstance, TaskXolPhase, UretAliveCheck, MAX_URETPROBE_DEPTH,
+};
 use crate::process::{ProcessControlBlock, ProcessFlags, ProcessManager};
+use crate::syscall::user_access::{copy_from_user_protected, write_one_to_user_protected};
 use kprobe::ProbeArgs;
 use log::{debug, warn};
 use system_error::SystemError;
@@ -70,6 +74,17 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
         }
     };
 
+    // ── uretprobe trampoline dispatch (mirrors the first-line compare in
+    // Linux handle_swbp) ──
+    // The trampoline is a permanent int3 slot inside the XOL area and is not
+    // in the uprobe_list hit table, so it must be dispatched before the
+    // lookup and must never fall into the probe's XOL single-step path. When
+    // the address has not been created it is 0, which differs from any legal
+    // break_addr.
+    if mm.xol_pool.trampoline_vaddr() == break_addr {
+        return uprobe_trampoline_handler(frame);
+    }
+
     // ── Phase 1：RCU 命中快照内复制 IRQ-safe 运行值 ──
     let captured = mm
         .uprobe_list
@@ -100,8 +115,34 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
 
     // ── Phase 1.5：锁外跑 event callback（评审 R12）──
     // rip 保持 raw（probe_vaddr+1）：BPF 回调经 break_address()=rip-1 取得原探针址。
-    if let Some(participants) = participants {
-        participants.for_each_active(|participant| participant.deliver(&pcb, frame));
+    // Entry callbacks are delivered only to !is_return participants
+    // (mirroring Linux handler_chain calling only uc->handler); if the
+    // snapshot contains an active is_return participant, the return address
+    // is hijacked right after.
+    let mut has_return_participant = false;
+    if let Some(participants) = participants.as_ref() {
+        participants.for_each_active(|participant| {
+            if participant.is_return() {
+                has_return_participant = true;
+            } else {
+                participant.deliver(&pcb, frame);
+            }
+        });
+    }
+
+    // ── Phase 1.6: uretprobe return-address hijack (Linux: uc->handler
+    // first, then prepare_uretprobe). Must happen after interrupts are
+    // re-enabled (user-stack reads/writes may fault) and before the XOL
+    // publication; any failure silently gives up this hijack (the entry
+    // callbacks have already run as usual). ──
+    if has_return_participant {
+        prepare_uretprobe(
+            &pcb,
+            mm.xol_pool.trampoline_vaddr(),
+            participants,
+            break_addr,
+            frame,
+        );
     }
 
     // ── Phase 2：保存 per-thread 活跃状态（评审 R2/R5）→ 重定向 rip → 置 TF ──
@@ -124,6 +165,268 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
     frame.rflags |= RFLAGS_TF;
 
     Ok(())
+}
+
+/// uretprobe return-address hijack (mirrors Linux `prepare_uretprobe` +
+/// `arch_uretprobe_hijack_return_addr`).
+///
+/// Called after the entry callbacks and before the XOL single-step
+/// publication, and necessarily **after interrupts are re-enabled**: reads
+/// and writes of the user stack may fault (`copy_*_protected` goes through
+/// exception-table fixup). Every failure mode silently gives up this hijack
+/// (entry callbacks are unaffected; the function returns to its original
+/// return address as usual):
+///
+/// - depth cap reached: give up after a ratelimited warning (DragonOS has no
+///   ratelimit facility yet, so a plain `warn!` stands in; see impl-notes);
+/// - reading `*(u64*)rsp` fails: the return-address slot was just written by
+///   the call, so it should always be resident in theory;
+/// - chained but the chain is empty: treated as user forgery (same as Linux
+///   uprobe_warn);
+/// - writing the trampoline fails: a single 8-byte exception-table write
+///   cannot be partial (review F5, no SIGSEGV path).
+///
+/// In the chained case (tail call / recursion reusing the same stack slot),
+/// dead frames are cleared first and the chain-head orig is reused, leaving
+/// the original return address from the first hijack on the stack so the
+/// assertion unwrapping stays symmetric (same as Linux).
+fn prepare_uretprobe(
+    pcb: &ProcessControlBlock,
+    trampoline_vaddr: usize,
+    participants: Option<alloc::sync::Arc<UprobeParticipantNode>>,
+    probe_vaddr: usize,
+    frame: &TrapFrame,
+) {
+    // The depth cap comes before any stack write (mirroring Linux: exceeding
+    // the limit simply gives up the hijack, leaving the old chain untouched).
+    if pcb.uret.depth() >= MAX_URETPROBE_DEPTH {
+        warn!(
+            "uprobe: omit uretprobe due to nestedness limit pid/tgid={:?}",
+            ProcessManager::current_pid()
+        );
+        return;
+    }
+
+    // Defensive: the registration path for is_return sites guarantees the
+    // trampoline exists; if a race reads 0 (should not happen), give up the
+    // hijack instead of writing 0 onto the user stack.
+    if trampoline_vaddr == 0 {
+        return;
+    }
+
+    // Reserve chain capacity before reading/writing the stack (maintainer
+    // review revision): guarantees that after the trampoline is written into
+    // the return-address slot, the later push cannot fail on allocation —
+    // otherwise the function return would hit a trampoline with no return
+    // instance (a spurious hit that unfairly kills the task with SIGILL).
+    // Mirrors Linux's "kmalloc ri first, then hijack the stack" ordering.
+    // A failed reservation (OOM / depth cap re-check) silently gives up.
+    if !pcb.uret.reserve_one() {
+        return;
+    }
+    let rsp = frame.stack_pointer();
+    // Read the return-address slot (rasize = 8 bytes). Failure silently
+    // gives up.
+    let mut orig_ret_vaddr: usize = 0;
+    let read = unsafe {
+        copy_from_user_protected(
+            core::slice::from_raw_parts_mut(
+                (&mut orig_ret_vaddr as *mut usize).cast::<u8>(),
+                core::mem::size_of::<usize>(),
+            ),
+            VirtAddr::new(rsp),
+        )
+    };
+    if read.is_err() {
+        return;
+    }
+
+    let chained = orig_ret_vaddr == trampoline_vaddr;
+    // Drop dead frames left by stack jumps such as longjmp (Linux
+    // cleanup_return_instances; context difference: chained re-entry uses RET
+    // semantics, a plain entry uses CALL semantics).
+    pcb.uret.cleanup_dead(
+        rsp,
+        if chained {
+            UretAliveCheck::Ret
+        } else {
+            UretAliveCheck::Call
+        },
+    );
+
+    if chained {
+        // The stack already holds the trampoline: reuse the chain head's
+        // (newest frame) original return address.
+        let Some(orig) = pcb.uret.head_orig_ret_vaddr() else {
+            // Trampoline read but the chain is empty: a fork leftover or user
+            // forgery; give up the hijack.
+            warn!(
+                "uprobe: handle tail call failed (empty return chain) pid {:?}",
+                ProcessManager::current_pid()
+            );
+            return;
+        };
+        orig_ret_vaddr = orig;
+    } else {
+        // Hijack: write the trampoline into the return-address slot. Failure
+        // silently gives up (review F5).
+        let written = unsafe { write_one_to_user_protected(VirtAddr::new(rsp), &trampoline_vaddr) };
+        if written.is_err() {
+            return;
+        }
+    }
+
+    let pushed = pcb.uret.push(ReturnInstance {
+        func: probe_vaddr,
+        stack: rsp,
+        orig_ret_vaddr,
+        chained,
+        participants,
+    });
+    debug_assert!(pushed, "uretprobe depth was pre-checked but push failed");
+}
+
+/// uretprobe trampoline hit handling (mirrors Linux `handle_trampoline`).
+///
+/// Entered via the dispatch in [`uprobe_breakpoint_handler`] once
+/// `break_addr == trampoline_vaddr` is matched: the function return has
+/// landed on the trampoline's int3, so pop the return-instance group, run the
+/// return callbacks, and restore rip to the original return address.
+/// **sp is never modified** (the return-address slot was already hijacked;
+/// nothing to restore).
+///
+/// - Spurious hit (empty chain: a fork-leftover address / user forgery):
+///   re-enable interrupts first, then force `SIGILL` (same as Linux
+///   `uprobe_warn` + `force_sig(SIGILL)`);
+/// - Normal hit: under the lock only classification + chain detach happen
+///   (review F3); outside the lock, delivery uses a **cloned TrapFrame**
+///   (rip = `orig_ret_vaddr + 1`, so that in the BPF context
+///   `break_address()` resolves back to the original return address;
+///   F5: never expose XOL/trampoline internal addresses) to deliver
+///   `is_return` participants; when `!valid` (longjmp already skipped
+///   shallower frames) the whole group is skipped and surviving groups
+///   continue to be processed.
+fn uprobe_trampoline_handler(frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let pcb = ProcessManager::current_pcb();
+    let rsp = frame.stack_pointer();
+
+    // ── Zero-allocation detach under the lock: take the whole chain
+    // (mem::take, capacity moves along, no allocation) ──
+    let mut chain = pcb.uret.take_all();
+    if chain.is_empty() {
+        // Spurious hit. Same as send_sigtrap_brkpt: leave the IRQ-disabled
+        // critical section before delivering the signal.
+        warn!(
+            "uprobe: unexpected uretprobe trampoline hit, pid {:?}, rip {:#x}; sending SIGILL",
+            ProcessManager::current_pid(),
+            frame.rip
+        );
+        unsafe { CurrentIrqArch::interrupt_enable() };
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
+            warn!(
+                "failed to send SIGILL for uretprobe trampoline, pid {:?}, err: {:?}",
+                ProcessManager::current_pid(),
+                err
+            );
+        }
+        return Ok(());
+    }
+
+    // The trampoline path's own interrupts-on point: return callbacks
+    // (BPF helpers included) may take locks and allocate.
+    unsafe { CurrentIrqArch::interrupt_enable() };
+
+    // ── Group classification and delivery outside the lock (index-based,
+    //    allocation-free throughout; maintainer review revision: the original
+    //    split_off ran under the lock / the first detach ran before
+    //    interrupts were re-enabled, both violating hit-path discipline) ──
+    //
+    // Group = chain[anchor..] (anchor = the first non-chained anchor scanning
+    // backward from the tail, anchor included), mirroring Linux
+    // find_next_ret_chain; valid = the frame before the anchor (shallower)
+    // does not exist, or its stack frame is still alive (RET semantics:
+    // rsp <= prev.stack).
+    let mut resume_ip: Option<usize> = None;
+    while !chain.is_empty() {
+        // The bottom-most (oldest) element always has chained == false
+        // (the chain was empty when it was pushed), so rposition always
+        // resolves; defensively treat an all-chained chain as one group.
+        let anchor = chain.iter().rposition(|ri| !ri.chained).unwrap_or(0);
+        let valid = match anchor.checked_sub(1) {
+            Some(prev) => UretAliveCheck::Ret.is_alive(&chain[prev], rsp),
+            None => true,
+        };
+
+        if valid {
+            // Delivery order: newest → oldest (the Linux free_ret_instance
+            // order).
+            for ri in chain[anchor..].iter().rev() {
+                if let Some(participants) = ri.participants.as_ref() {
+                    // Clone the TrapFrame (TrapFrame: Copy) and set
+                    // rip=orig+1: in the callback context
+                    // break_address()=rip-1 resolves back to the original
+                    // return address, while the real frame's rip is restored
+                    // uniformly outside the loop (blind spot #3: the callback
+                    // window never touches the real frame, so a synchronous
+                    // exception's si_addr cannot leak the trampoline
+                    // address).
+                    let mut cb_frame = *frame;
+                    cb_frame.set_rip(ri.orig_ret_vaddr + 1);
+                    participants.for_each_active(|participant| {
+                        if participant.is_return() {
+                            participant.deliver(&pcb, &cb_frame);
+                        }
+                    });
+                }
+            }
+            // Resume target = the newest (deepest) frame's orig within the
+            // group (a chained group shares the same value).
+            resume_ip = Some(chain[chain.len() - 1].orig_ret_vaddr);
+        }
+        // The group is discarded whether valid or not (!valid: longjmp
+        // already skipped shallower frames, so the whole group gets no
+        // delivery and the rip restore value is overwritten by the next
+        // round — only the final valid group's value becomes visible to
+        // users, as in Linux). truncate releases the group's participant
+        // Arcs — dropped outside the lock (review F3).
+        chain.truncate(anchor);
+
+        if valid {
+            break;
+        }
+        // !valid implies a shallower frame exists (anchor-1); the loop
+        // continues with it as the anchor.
+    }
+
+    if let Some(ip) = resume_ip {
+        // Put the unconsumed prefix back (no allocation). The chain is
+        // task-private: this handler holds exclusive modification rights, so
+        // no concurrent modification can happen during delivery.
+        pcb.uret.restore_prefix(chain);
+        frame.set_rip(ip);
+        debug!("uprobe uretprobe return handled: resume {:#x}", ip);
+        Ok(())
+    } else {
+        // The chain was drained group by group without any valid group
+        // appearing (theoretically unreachable: the shallowest frame has
+        // anchor==0 and therefore valid==true). Fail-safe handling: rip
+        // still points to trampoline+1 and must never return to user mode
+        // like this (it would re-execute int3 in an endless loop), so signal
+        // SIGILL with spurious-hit semantics.
+        debug_assert!(chain.is_empty());
+        warn!(
+            "uprobe: uretprobe return chain exhausted mid-handle, pid {:?}; sending SIGILL",
+            ProcessManager::current_pid()
+        );
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
+            warn!(
+                "failed to send SIGILL for uretprobe trampoline, pid {:?}, err: {:?}",
+                ProcessManager::current_pid(),
+                err
+            );
+        }
+        Ok(())
+    }
 }
 
 /// 用户态 #DB 分发：task XOL state 为 active → XOL 单步完成（消费）；否则本

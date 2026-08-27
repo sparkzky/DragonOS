@@ -382,6 +382,10 @@ impl ProcessManager {
         // 的强引用，再进入 mm teardown。该清理不需要也不应改 trapframe。
         #[cfg(target_arch = "x86_64")]
         crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
+        // The uretprobe return-instance chain is likewise bound to the old
+        // user context: drop it without delivering return callbacks.
+        #[cfg(target_arch = "x86_64")]
+        crate::process::uprobe::cleanup_task_uret_instances(&current_pcb);
 
         let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();

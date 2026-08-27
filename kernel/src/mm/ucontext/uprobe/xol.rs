@@ -36,7 +36,27 @@ fn take_reachable_slot(
     }
     None
 }
-
+/// Take the index of the lowest free slot in the bitmap (reachable window not
+/// checked) — the allocation core dedicated to the uretprobe trampoline (see
+/// [`XolPage::alloc_any_slot`]), extracted as a pure function for unit tests.
+fn take_any_slot(bitmap: &mut [u64; XOL_BITMAP_WORDS]) -> Option<usize> {
+    for (word_idx, word) in bitmap.iter_mut().enumerate() {
+        if *word == u64::MAX {
+            continue;
+        }
+        // The lowest free bit of this word; bits are scanned in ascending
+        // slot order, so the first in-range hit is also the lowest one.
+        let bit = (!*word).trailing_zeros() as usize;
+        let slot = word_idx * 64 + bit;
+        if slot < XOL_SLOTS_PER_PAGE {
+            *word |= 1u64 << bit;
+            return Some(slot);
+        }
+        // Out-of-range bits can only be followed by higher (equally
+        // out-of-range) bits, and later words only hold higher slots.
+    }
+    None
+}
 /// One page in a per-mm XOL (eXecute Out of Line) pool.
 ///
 /// The page is mapped read/execute in userspace and divided into 16-byte
@@ -65,6 +85,22 @@ impl XolPage {
             generation: NEXT_XOL_GENERATION.fetch_add(1, Ordering::Relaxed),
             slot_bitmap: SpinLock::new([0u64; XOL_BITMAP_WORDS]),
         })
+    }
+
+    /// Take this page's lowest free slot, ignoring the disp32 reachable
+    /// window.
+    ///
+    /// Reserved for the uretprobe trampoline: the return address is an
+    /// absolute 8-byte value on the stack, so there is no RIP-relative
+    /// constraint (see [`XolPool::ensure_trampoline`]).
+    /// The slot is never freed — no lease is created, and once the bitmap bit
+    /// is set nobody clears it; the page is released when the mm dies.
+    ///
+    /// Returns the slot's byte offset within the page (same as
+    /// [`Self::alloc_slot_in`]).
+    pub(super) fn alloc_any_slot(&self) -> Option<usize> {
+        let mut bitmap = self.slot_bitmap.lock_irqsave();
+        take_any_slot(&mut bitmap).map(|slot| slot * XOL_SLOT_SIZE)
     }
 
     pub(super) fn alloc_slot_in(
@@ -155,8 +191,15 @@ impl core::fmt::Debug for XolSlotLease {
 /// The pool grows one page at a time on the registration cold path instead.
 pub struct XolPool {
     pages: Mutex<Vec<Arc<XolPage>>>,
+    /// User virtual address of the uretprobe trampoline (0 = not created yet).
+    ///
+    /// Lazy any-slot scheme (review F2): the trampoline does not occupy a
+    /// fixed slot0 and probe-slot allocation logic is untouched; the address
+    /// becomes visible to the #BP path only after 0xcc is successfully written
+    /// and published (Release/Acquire), avoiding the
+    /// `discard_unpublished_xol_page` rollback window.
+    trampoline_vaddr: AtomicUsize,
 }
-
 impl core::fmt::Debug for XolPool {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // AddressSpace formatting may happen on diagnostic paths. Do not take
@@ -164,11 +207,11 @@ impl core::fmt::Debug for XolPool {
         f.debug_struct("XolPool").finish_non_exhaustive()
     }
 }
-
 impl XolPool {
     pub fn new() -> Self {
         Self {
             pages: Mutex::new(Vec::new()),
+            trampoline_vaddr: AtomicUsize::new(0),
         }
     }
 
@@ -189,6 +232,96 @@ impl XolPool {
             // disp32 interval are excluded by the two binary searches above.
             .rev()
             .find_map(|page| page.alloc_slot_in(reachable).map(Arc::new))
+    }
+
+    /// User virtual address of the uretprobe trampoline (0 = not created yet).
+    ///
+    /// The #BP hit path compares break_addr against this value after resolving
+    /// the mm and before consulting the hit table (mirroring Linux's
+    /// `get_trampoline_vaddr()`; see the dispatch in `exception/uprobe.rs`).
+    /// Lock-free atomic read, callable from the IRQ-disabled exception path.
+    pub fn trampoline_vaddr(&self) -> usize {
+        self.trampoline_vaddr.load(Ordering::Acquire)
+    }
+
+    fn published_trampoline(&self) -> Option<usize> {
+        let vaddr = self.trampoline_vaddr.load(Ordering::Acquire);
+        (vaddr != 0).then_some(vaddr)
+    }
+
+    /// Take a free slot on the given page, write int3 (0xcc) through the
+    /// kernel direct-map, and publish the trampoline address.
+    ///
+    /// Once the bitmap bit is set nobody clears it: the slot is never freed,
+    /// no lease is created, and the page is released when the mm dies (the
+    /// sole exception is [`Self::withdraw_trampoline_on_page`]).
+    fn install_trampoline_in(&self, page: &XolPage) -> Option<usize> {
+        // Verify direct-map reachability before consuming the bitmap bit, so a
+        // failing path cannot leak the slot.
+        let kva = unsafe { MMArch::phys_2_virt(page.page_paddr()) }?;
+        let offset = page.alloc_any_slot()?;
+        unsafe {
+            core::ptr::write_volatile((kva.data() + offset) as *mut u8, 0xcc);
+        }
+        let vaddr = page.slot_vaddr(offset).data();
+        self.trampoline_vaddr.store(vaddr, Ordering::Release);
+        Some(vaddr)
+    }
+
+    /// Ensure a trampoline slot exists (lazy any-slot scheme, review F2).
+    ///
+    /// Scans the pool's existing pages in ascending address order and takes
+    /// any free slot (reachable window ignored — the return address is an
+    /// absolute value with no disp32 constraint). Returns `ENOMEM` when the
+    /// pool has no vacancy; the caller (the registration path holding
+    /// `mm.write`, see `site.rs`) then grows the pool and retries.
+    ///
+    /// Should only be called on the install path (holding mm.write); the #BP
+    /// path only reads [`Self::trampoline_vaddr`].
+    pub(super) fn ensure_trampoline(&self) -> Result<usize, SystemError> {
+        if let Some(vaddr) = self.published_trampoline() {
+            return Ok(vaddr);
+        }
+        let pages = self.pages.lock();
+        if let Some(vaddr) = self.published_trampoline() {
+            return Ok(vaddr);
+        }
+        pages
+            .iter()
+            .find_map(|page| self.install_trampoline_in(page))
+            .ok_or(SystemError::ENOMEM)
+    }
+
+    /// Install the trampoline on a page freshly grown for it (the caller keeps
+    /// page ownership: `add_page` on success, or drop it along with
+    /// [`Self::withdraw_trampoline_on_page`] on failure).
+    pub(super) fn install_trampoline_on_fresh(
+        &self,
+        page: &Arc<XolPage>,
+    ) -> Result<usize, SystemError> {
+        if let Some(vaddr) = self.published_trampoline() {
+            return Ok(vaddr);
+        }
+        self.install_trampoline_in(page).ok_or(SystemError::EFAULT)
+    }
+
+    /// Called before discarding a freshly grown XOL page on registration
+    /// failure: if the trampoline happens to sit on that page, withdraw the
+    /// published address. Safety precondition (guaranteed by call sites): the
+    /// trampoline was created only within this registration and no published
+    /// is_return breakpoint references it yet, so the withdrawal leaves no
+    /// dangling return address.
+    pub(super) fn withdraw_trampoline_on_page(&self, page: &XolPage) {
+        let base = page.page_base().data();
+        let current = self.trampoline_vaddr.load(Ordering::Acquire);
+        if current != 0 && current >= base && current < base + MMArch::PAGE_SIZE {
+            let _ = self.trampoline_vaddr.compare_exchange(
+                current,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 
     /// Reserve the collection entry before mapping a new page. Registration
@@ -254,5 +387,37 @@ mod tests {
             Some(7 * XOL_SLOT_SIZE)
         );
         assert_eq!(bitmap[0], 1 << 7);
+    }
+
+    #[test]
+    fn take_any_slot_returns_lowest_free_and_marks_it() {
+        let mut bitmap = [0u64; XOL_BITMAP_WORDS];
+        assert_eq!(take_any_slot(&mut bitmap), Some(0));
+        // Slot 0 is taken; the next one is still this page's lowest free bit.
+        assert_eq!(take_any_slot(&mut bitmap), Some(1));
+        assert_eq!(bitmap[0] & 0b11, 0b11);
+    }
+
+    #[test]
+    fn take_any_slot_skips_fully_occupied_prefix_words() {
+        let mut bitmap = [0u64; XOL_BITMAP_WORDS];
+        bitmap[0] = u64::MAX;
+        bitmap[1] = 0b110; // slots 64+1 and 64+2 already taken
+        assert_eq!(take_any_slot(&mut bitmap), Some(64));
+        assert_eq!(bitmap[1], 0b111);
+    }
+
+    #[test]
+    fn take_any_slot_respects_page_slot_capacity_and_exhausts() {
+        let mut bitmap = [u64::MAX; XOL_BITMAP_WORDS];
+        // High bits of the last word exceed the page's slot capacity (256)
+        // and must not be allocated.
+        let bits = XOL_SLOTS_PER_PAGE % 64;
+        bitmap[XOL_BITMAP_WORDS - 1] = if bits == 0 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        assert_eq!(take_any_slot(&mut bitmap), None);
     }
 }

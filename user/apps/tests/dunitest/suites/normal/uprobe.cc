@@ -58,6 +58,11 @@ constexpr const char* UPROBE_TYPE_PATH =
 constexpr const char* TASK_SCOPED_EXEC_MODE =
     "--uprobe-task-scoped-exec-phase";
 
+// Post-exec phase of UretprobeExecInsideProbedFrameCleansUp: after execl
+// succeeds inside the hijacked frame, the new image exits directly with this
+// argument (loose assertion: exit code only).
+constexpr const char* URETPROBE_EXEC_MODE = "--uretprobe-exec-phase";
+
 struct UprobePerfEventOptions {
     pid_t pid = 0;
     int cpu = -1;
@@ -118,6 +123,52 @@ bool read_uprobe_perf_type(__u32& type) {
 __attribute__((noinline)) int uprobe_target(int x) {
     asm volatile("" : "+r"(x) : : "memory");  // 防止内联/优化掉
     return x * 2 + 1;
+}
+
+// ===== uretprobe (issue #2150 phase 2) target functions =====
+// Kept separate from phase 1's uprobe_target to avoid sharing a site; the
+// return formula is deliberately different so link-time identical-code-folding
+// cannot merge the two functions onto the same address.
+
+__attribute__((noinline)) int uret_target(int x) {
+    asm volatile("" : "+r"(x) : : "memory");
+    return x * 3 + 2;
+}
+
+// Self-recursive target: every recursive call goes through one entry hijack
+// and pushes its own return instance; returns deliver level by level.
+__attribute__((noinline)) int uret_recursive_target(int depth) {
+    asm volatile("" : "+r"(depth) : : "memory");
+    if (depth <= 0) return 1000;
+    int child = uret_recursive_target(depth - 1);
+    // The barrier prevents "tail recursion + accumulation" from being turned
+    // into a loop: k real call frames must survive, each pushing one return
+    // instance (otherwise the count would always be 1).
+    asm volatile("" : "+r"(child) : : "memory");
+    return child + 1;
+}
+
+// Mutual-call chain A→B: both functions carry a uretprobe; one outer call
+// should count one return on each.
+__attribute__((noinline)) int uret_chain_b(int x) {
+    asm volatile("" : "+r"(x) : : "memory");
+    return x * 2;
+}
+
+__attribute__((noinline)) int uret_chain_a(int x) {
+    asm volatile("" : "+r"(x) : : "memory");
+    return uret_chain_b(x) + 1;
+}
+
+// exec inside a frame whose return address is already hijacked: after the
+// entry hit swaps the on-stack return address for the trampoline, execl never
+// returns. The exec path must clean up the return-instance chain and the new
+// image exits normally via URETPROBE_EXEC_MODE.
+__attribute__((noinline)) int uret_exec_target(int x) {
+    asm volatile("" : "+r"(x) : : "memory");
+    execl("/proc/self/exe", "/proc/self/exe", URETPROBE_EXEC_MODE,
+          static_cast<char*>(nullptr));
+    return x * 2 + 1;  // reached only if exec failed
 }
 
 // This mode runs before GoogleTest initialization after the exec half of
@@ -341,6 +392,124 @@ bpf_insn bpf_exit() {
     bpf_insn insn = {};
     insn.code = BPF_JMP | BPF_EXIT;
     return insn;
+}
+
+// ===== BPF instruction builders for uretprobe (following the hand-written
+// pattern of bpf_mov64_imm above) =====
+
+// 64-bit immediate load (ld_imm64, two instructions); when
+// src_reg=BPF_PSEUDO_MAP_FD the low 32 bits of value are a map fd, which the
+// kernel verifier relocates into a map pointer.
+void bpf_emit_ld_imm64(std::vector<bpf_insn>& instructions, unsigned int dst,
+                       __u64 value, unsigned int src_reg = 0) {
+    bpf_insn low = {};
+    low.code = BPF_LD | BPF_DW | BPF_IMM;
+    low.dst_reg = dst;
+    low.src_reg = src_reg;
+    low.imm = static_cast<__s32>(value & 0xffffffffU);
+    instructions.push_back(low);
+    bpf_insn high = {};
+    high.imm = static_cast<__s32>(value >> 32);
+    instructions.push_back(high);
+}
+
+bpf_insn bpf_mov64_imm_dst(unsigned int dst, __s32 value) {
+    bpf_insn insn = {};
+    insn.code = BPF_ALU64 | BPF_MOV | BPF_K;
+    insn.dst_reg = dst;
+    insn.imm = value;
+    return insn;
+}
+
+bpf_insn bpf_mov64_reg(unsigned int dst, unsigned int src) {
+    bpf_insn insn = {};
+    insn.code = BPF_ALU64 | BPF_MOV | BPF_X;
+    insn.dst_reg = dst;
+    insn.src_reg = src;
+    return insn;
+}
+
+bpf_insn bpf_alu64_add_imm(unsigned int dst, __s32 value) {
+    bpf_insn insn = {};
+    insn.code = BPF_ALU64 | BPF_ADD | BPF_K;
+    insn.dst_reg = dst;
+    insn.imm = value;
+    return insn;
+}
+
+// dst = *(u64*)(src + off)
+bpf_insn bpf_ldx_mem_dw(unsigned int dst, unsigned int src, __s16 off) {
+    bpf_insn insn = {};
+    insn.code = BPF_LDX | BPF_MEM | BPF_DW;
+    insn.dst_reg = dst;
+    insn.src_reg = src;
+    insn.off = off;
+    return insn;
+}
+
+// *(u64*)(dst + off) = src
+bpf_insn bpf_stx_mem_dw(unsigned int dst, unsigned int src, __s16 off) {
+    bpf_insn insn = {};
+    insn.code = BPF_STX | BPF_MEM | BPF_DW;
+    insn.dst_reg = dst;
+    insn.src_reg = src;
+    insn.off = off;
+    return insn;
+}
+
+// *(u64*)(dst + off) = imm
+bpf_insn bpf_st_imm_dw(unsigned int dst, __s16 off, __s32 value) {
+    bpf_insn insn = {};
+    insn.code = BPF_ST | BPF_MEM | BPF_DW;
+    insn.dst_reg = dst;
+    insn.off = off;
+    insn.imm = value;
+    return insn;
+}
+
+bpf_insn bpf_call_helper(__s32 helper_id) {
+    bpf_insn insn = {};
+    insn.code = BPF_JMP | BPF_CALL;
+    insn.imm = helper_id;
+    return insn;
+}
+
+// DragonOS helper ids are aligned with Linux (kernel/src/bpf/helper/consts.rs):
+// bpf_map_update_elem=2; bpf_probe_read_user=112 (new in phase 2).
+constexpr __s32 kBpfHelperMapUpdateElem = 2;
+constexpr __s32 kBpfHelperProbeReadUser = 112;
+
+#if defined(__x86_64__)
+// Byte offset of rax within the x86-64 BPF context (KProbeContext,
+// kernel/src/arch/x86_64/kprobe.rs, repr(C) laid out in pt_regs order):
+// rax comes right after the 10 registers r15..r8 (10*8=80). The BPF-side
+// equivalent of PT_REGS_RC.
+constexpr __s16 kPtRegsRcOffset = 80;
+#endif
+
+// User-space global buffer for the bpf_probe_read_user case: its address is
+// baked in when the prog is loaded.
+volatile __u64 g_uret_user_buffer = 0;
+
+int create_array_map(__u32 value_size, __u32 max_entries) {
+    alignas(union bpf_attr) unsigned char attr_storage[512] = {};
+    auto& attr = *reinterpret_cast<union bpf_attr*>(attr_storage);
+    attr.map_type = BPF_MAP_TYPE_ARRAY;
+    attr.key_size = 4;
+    attr.value_size = value_size;
+    attr.max_entries = max_entries;
+    return static_cast<int>(
+        syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof(attr_storage)));
+}
+
+int lookup_map_elem(int map_fd, const void* key, void* value) {
+    alignas(union bpf_attr) unsigned char attr_storage[512] = {};
+    auto& attr = *reinterpret_cast<union bpf_attr*>(attr_storage);
+    attr.map_fd = static_cast<__u32>(map_fd);
+    attr.key = reinterpret_cast<__u64>(key);
+    attr.value = reinterpret_cast<__u64>(value);
+    return static_cast<int>(
+        syscall(SYS_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr_storage)));
 }
 
 constexpr unsigned char RAW_TARGET_CODE[] = {
@@ -682,11 +851,10 @@ TEST(UprobeTest, UnsupportedConfigAndPerfCoreOptionsAreRejected) {
         EXPECT_EQ(errno, EOPNOTSUPP) << name;
     };
 
+    // config=1 (bit0=IS_RETPROBE) is legal as of phase 2; its positive
+    // semantics are covered by the Uretprobe* cases below — only the bits
+    // still unsupported are kept here.
     UprobePerfEventOptions options;
-    options.config = 1;  // retprobe
-    expect_eopnotsupp("retprobe config", options);
-
-    options = {};
     options.config = 1ULL << 32;  // USDT ref_ctr_offset
     expect_eopnotsupp("ref_ctr_offset config", options);
 
@@ -2123,6 +2291,306 @@ TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {
         << "large SET_BPF failed, errno=" << errno;
 }
 
+// ===== uretprobe (issue #2150 phase 2) =====
+
+// Basic semantics: a uretprobe counts only at function return (entry hits are
+// not counted) and the hijack is fully transparent to the return value. If
+// the hijack or the trampoline restore is done wrong, this crashes / miscounts.
+TEST(UprobeTest, UretprobeCountsReturnsAndPreservesReturnValue) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_target), path, offset))
+        << "无法从 /proc/self/maps 解析 uret_target 偏移";
+
+    UprobePerfEventOptions options;
+    options.config = 1;  // bit0 = IS_RETPROBE
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(fd.get(), 0)
+        << "config=1 的 perf_event_open 失败，errno=" << errno
+        << "（内核可能未启用 uretprobe）";
+    ASSERT_GE(ioctl(fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0)
+        << "PERF_EVENT_IOC_ENABLE 失败，errno=" << errno;
+
+    constexpr int kCalls = 32;
+    for (int i = 0; i < kCalls; ++i) {
+        volatile int result = uret_target(i);
+        EXPECT_EQ(result, i * 3 + 2) << "第 " << i << " 次返回值被劫持破坏";
+    }
+
+    __u64 count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, static_cast<__u64>(kCalls))
+        << "uretprobe 应只统计返回次数（入口命中不计）";
+}
+
+#if defined(__x86_64__)
+// Return-value capture: rax in the return callback's BPF context (PT_REGS_RC)
+// must be the function's return value.
+TEST(UprobeTest, UretprobeBpfCapturesReturnValueInPtRegsRc) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_target), path, offset));
+
+    FdGuard map(create_array_map(8, 1));
+    ASSERT_GE(map.get(), 0) << "BPF_MAP_CREATE 失败，errno=" << errno;
+
+    std::vector<bpf_insn> instructions;
+    instructions.push_back(
+        bpf_ldx_mem_dw(BPF_REG_0, BPF_REG_1, kPtRegsRcOffset));
+    instructions.push_back(bpf_stx_mem_dw(BPF_REG_10, BPF_REG_0, -8));  // value
+    instructions.push_back(bpf_st_imm_dw(BPF_REG_10, -16, 0));          // key=0
+    bpf_emit_ld_imm64(instructions, BPF_REG_1,
+                      static_cast<__u64>(map.get()), BPF_PSEUDO_MAP_FD);
+    instructions.push_back(bpf_mov64_reg(BPF_REG_2, BPF_REG_10));
+    instructions.push_back(bpf_alu64_add_imm(BPF_REG_2, -16));
+    instructions.push_back(bpf_mov64_reg(BPF_REG_3, BPF_REG_10));
+    instructions.push_back(bpf_alu64_add_imm(BPF_REG_3, -8));
+    instructions.push_back(bpf_mov64_imm_dst(BPF_REG_4, 0));  // flags
+    instructions.push_back(bpf_call_helper(kBpfHelperMapUpdateElem));
+    instructions.push_back(bpf_mov64_imm(0));  // return 0: counts as a hit
+    instructions.push_back(bpf_exit());
+    FdGuard program(load_kprobe_bpf_program(instructions));
+    ASSERT_GE(program.get(), 0) << "BPF_PROG_LOAD 失败，errno=" << errno;
+
+    UprobePerfEventOptions options;
+    options.config = 1;
+    FdGuard event(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(event.get(), 0) << "uretprobe open 失败，errno=" << errno;
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
+        << "SET_BPF 失败，errno=" << errno;
+
+    EXPECT_EQ(uret_target(21), 65);
+    EXPECT_EQ(uret_target(5), 17);
+
+    __u32 key = 0;
+    __u64 value = 0;
+    ASSERT_EQ(lookup_map_elem(map.get(), &key, &value), 0)
+        << "BPF_MAP_LOOKUP_ELEM 失败，errno=" << errno;
+    EXPECT_EQ(value, 17ULL) << "map 应记录最后一次返回的 RAX";
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U);
+}
+#endif
+
+// bpf_probe_read_user (helper 112): read user address-space memory inside a
+// return callback.
+TEST(UprobeTest, UretprobeBpfProbeReadUserReadsUserMemory) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_target), path, offset));
+
+    FdGuard map(create_array_map(8, 1));
+    ASSERT_GE(map.get(), 0) << "BPF_MAP_CREATE 失败，errno=" << errno;
+
+    constexpr __u64 kMagic = 0x1122334455667788ULL;
+    g_uret_user_buffer = kMagic;
+
+    std::vector<bpf_insn> instructions;
+    bpf_emit_ld_imm64(instructions, BPF_REG_3,
+                      reinterpret_cast<__u64>(&g_uret_user_buffer));
+    instructions.push_back(bpf_mov64_imm_dst(BPF_REG_2, 8));  // size
+    instructions.push_back(bpf_mov64_reg(BPF_REG_1, BPF_REG_10));
+    instructions.push_back(bpf_alu64_add_imm(BPF_REG_1, -8));  // dst stack slot
+    instructions.push_back(bpf_call_helper(kBpfHelperProbeReadUser));
+    instructions.push_back(bpf_ldx_mem_dw(BPF_REG_0, BPF_REG_10, -8));
+    instructions.push_back(bpf_stx_mem_dw(BPF_REG_10, BPF_REG_0, -16));
+    instructions.push_back(bpf_st_imm_dw(BPF_REG_10, -24, 0));  // key=0
+    bpf_emit_ld_imm64(instructions, BPF_REG_1,
+                      static_cast<__u64>(map.get()), BPF_PSEUDO_MAP_FD);
+    instructions.push_back(bpf_mov64_reg(BPF_REG_2, BPF_REG_10));
+    instructions.push_back(bpf_alu64_add_imm(BPF_REG_2, -24));
+    instructions.push_back(bpf_mov64_reg(BPF_REG_3, BPF_REG_10));
+    instructions.push_back(bpf_alu64_add_imm(BPF_REG_3, -16));
+    instructions.push_back(bpf_mov64_imm_dst(BPF_REG_4, 0));  // flags
+    instructions.push_back(bpf_call_helper(kBpfHelperMapUpdateElem));
+    instructions.push_back(bpf_mov64_imm(0));
+    instructions.push_back(bpf_exit());
+    FdGuard program(load_kprobe_bpf_program(instructions));
+    ASSERT_GE(program.get(), 0) << "BPF_PROG_LOAD 失败，errno=" << errno;
+
+    UprobePerfEventOptions options;
+    options.config = 1;
+    FdGuard event(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(event.get(), 0) << "uretprobe open 失败，errno=" << errno;
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
+        << "SET_BPF 失败，errno=" << errno;
+
+    EXPECT_EQ(uret_target(1), 5);
+
+    __u32 key = 0;
+    __u64 value = 0;
+    ASSERT_EQ(lookup_map_elem(map.get(), &key, &value), 0)
+        << "BPF_MAP_LOOKUP_ELEM 失败，errno=" << errno;
+    EXPECT_EQ(value, kMagic)
+        << "bpf_probe_read_user 应读到用户态全局缓冲区内容";
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+}
+
+// Recursion: the probed function recurses k levels, each pushing one return
+// instance; the count == k. Potential bugs: wrong list insert/pop order, or
+// the liveness check discarding live frames as dead ones.
+TEST(UprobeTest, UretprobeCountsRecursiveFramesIndependently) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_recursive_target), path,
+                    offset))
+        << "无法从 /proc/self/maps 解析 uret_recursive_target 偏移";
+
+    UprobePerfEventOptions options;
+    options.config = 1;
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(fd.get(), 0) << "uretprobe open 失败，errno=" << errno;
+    ASSERT_GE(ioctl(fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+
+    // kDepth levels of self-recursion = kDepth function calls in total
+    // (outermost included), each pushing one return instance and each
+    // delivering one return event.
+    constexpr int kDepth = 8;
+    EXPECT_EQ(uret_recursive_target(kDepth - 1), 999 + kDepth)
+        << "递归返回值被劫持破坏";
+
+    __u64 count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, static_cast<__u64>(kDepth))
+        << "每层递归应各投递一次返回事件";
+}
+
+// Mutual-call chain A→B: both functions carry a uretprobe; after one outer
+// call, each fd counts once.
+TEST(UprobeTest, UretprobeChainAcrossTwoFunctionsCountsBoth) {
+    std::string path_a;
+    std::string path_b;
+    unsigned long offset_a = 0;
+    unsigned long offset_b = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uret_chain_a), path_a, offset_a));
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uret_chain_b), path_b, offset_b));
+
+    UprobePerfEventOptions options;
+    options.config = 1;
+    FdGuard fd_a(open_uprobe_perf_event(path_a, offset_a, options));
+    ASSERT_GE(fd_a.get(), 0) << "uretprobe(A) open 失败，errno=" << errno;
+    FdGuard fd_b(open_uprobe_perf_event(path_b, offset_b, options));
+    ASSERT_GE(fd_b.get(), 0) << "uretprobe(B) open 失败，errno=" << errno;
+    ASSERT_GE(ioctl(fd_a.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+    ASSERT_GE(ioctl(fd_b.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+
+    constexpr int kCalls = 5;
+    for (int i = 0; i < kCalls; ++i) {
+        EXPECT_EQ(uret_chain_a(i), i * 2 + 1) << "第 " << i << " 次链结果错误";
+    }
+
+    __u64 count_a = 0;
+    __u64 count_b = 0;
+    ASSERT_EQ(read(fd_a.get(), &count_a, sizeof(count_a)),
+              static_cast<ssize_t>(sizeof(count_a)));
+    ASSERT_EQ(read(fd_b.get(), &count_b, sizeof(count_b)),
+              static_cast<ssize_t>(sizeof(count_b)));
+    EXPECT_EQ(count_a, static_cast<__u64>(kCalls));
+    EXPECT_EQ(count_b, static_cast<__u64>(kCalls));
+}
+
+// exec cleanup: exec inside a hijacked frame — the return-instance chain must
+// be cleaned up by the exec path. Loose assertions: the new image exits
+// normally (exit code 0), without crashing or being killed by a signal due to
+// leftover state.
+TEST(UprobeTest, UretprobeExecInsideProbedFrameCleansUp) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_exec_target), path,
+                    offset))
+        << "无法从 /proc/self/maps 解析 uret_exec_target 偏移";
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed, errno=" << errno;
+    if (child == 0) {
+        UprobePerfEventOptions options;
+        options.config = 1;
+        const int fd = open_uprobe_perf_event(path, offset, options);
+        if (fd < 0) _exit(10);
+        if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) < 0) _exit(11);
+        // execl after the entry hijack: if exec succeeds it never returns and
+        // the new image ends with exit code 0.
+        if (uret_exec_target(7) != 15) _exit(12);
+        _exit(13);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status))
+        << "exec 子进程被信号 " << WTERMSIG(status) << " 终止";
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "被劫持帧内 exec 后新镜像应正常退出，exit="
+        << WEXITSTATUS(status);
+}
+
+// config=1 does not loosen offset validation: out-of-range offsets are
+// rejected with phase-1 semantics (EINVAL).
+TEST(UprobeTest, UretprobeInvalidOffsetIsRejected) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_target), path, offset));
+
+    UprobePerfEventOptions options;
+    options.config = 1;
+    errno = 0;
+    FdGuard fd(open_uprobe_perf_event(path, 0xFFFFFFFFFFFFULL, options));
+    EXPECT_LT(fd.get(), 0) << "config=1 不应放宽越界偏移校验";
+    EXPECT_EQ(errno, EINVAL);
+}
+
+// uprobe and uretprobe at the same address with two fds: the entry fd counts
+// entry hits only, the return fd counts returns only.
+TEST(UprobeTest, UretprobeAndUprobeAtSameAddressCountIndependently) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uret_target), path, offset));
+
+    FdGuard entry_fd(open_uprobe_perf_event(path, offset));  // config=0
+    ASSERT_GE(entry_fd.get(), 0) << "uprobe open 失败，errno=" << errno;
+    UprobePerfEventOptions options;
+    options.config = 1;
+    FdGuard ret_fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(ret_fd.get(), 0)
+        << "同址 uretprobe open 失败，errno=" << errno;
+    ASSERT_GE(ioctl(entry_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+    ASSERT_GE(ioctl(ret_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+
+    constexpr int kCalls = 16;
+    for (int i = 0; i < kCalls; ++i) {
+        volatile int result = uret_target(i);
+        EXPECT_EQ(result, i * 3 + 2);
+    }
+
+    __u64 entry_count = 0;
+    __u64 ret_count = 0;
+    ASSERT_EQ(read(entry_fd.get(), &entry_count, sizeof(entry_count)),
+              static_cast<ssize_t>(sizeof(entry_count)));
+    ASSERT_EQ(read(ret_fd.get(), &ret_count, sizeof(ret_count)),
+              static_cast<ssize_t>(sizeof(ret_count)));
+    EXPECT_EQ(entry_count, static_cast<__u64>(kCalls))
+        << "入口 fd 不应统计返回事件";
+    EXPECT_EQ(ret_count, static_cast<__u64>(kCalls))
+        << "返回 fd 不应统计入口事件";
+}
+
 #if defined(__x86_64__)
 TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
     static_assert(sizeof(TestRseqAbi) == 32);
@@ -2520,6 +2988,11 @@ int main(int argc, char** argv) {
             parsed > std::numeric_limits<int>::max())
             return 64;
         return run_task_scoped_exec_phase(static_cast<int>(parsed));
+    }
+    if (argc == 2 && std::strcmp(argv[1], URETPROBE_EXEC_MODE) == 0) {
+        // Second half of the exec-inside-hijacked-frame test: reaching this
+        // point proves the exec cleanup did not crash.
+        return 0;
     }
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

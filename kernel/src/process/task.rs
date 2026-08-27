@@ -85,6 +85,10 @@ pub struct ProcessControlBlock {
     /// routing does not become process state ownership.
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe: super::uprobe::TaskXolState,
+    /// Per-task uretprobe return-instance chain. Tail = newest = deepest
+    /// frame; see `process/uprobe.rs` for the lock discipline.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uret: super::uprobe::TaskUretState,
     /// Whether the current task has been counted in the global visible thread
     /// count.
     pub(super) visible_thread_accounted: AtomicBool,
@@ -394,6 +398,8 @@ impl ProcessControlBlock {
                 rlimits: RwLock::new(Self::default_rlimits()),
                 #[cfg(target_arch = "x86_64")]
                 uprobe: super::uprobe::TaskXolState::new(),
+                #[cfg(target_arch = "x86_64")]
+                uret: super::uprobe::TaskUretState::new(),
             };
 
             pcb.sig_info.write().set_tty(tty);

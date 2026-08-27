@@ -90,6 +90,12 @@ impl UprobeConsumerScope {
 
 pub struct UprobeConsumerRuntime {
     pub event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
+    /// Whether this is a return probe (uretprobe): the callback runs at
+    /// function return instead of at entry. Part of the consumer identity
+    /// like the callback itself, propagated through epoch → endpoint →
+    /// snapshot to the hit path (entry-callback filter `!is_return`,
+    /// hijack decision `is_return`).
+    pub is_return: bool,
 }
 
 #[derive(Clone)]
@@ -113,6 +119,17 @@ impl UprobeConsumerRuntimeSnapshot {
         if let Some(callback) = self.endpoint.callback.as_ref().and_then(Weak::upgrade) {
             callback.call(args);
         }
+    }
+
+    /// Whether this participant is a return probe (uretprobe).
+    ///
+    /// The entry hit path filters on this: entry callbacks are delivered
+    /// only to `!is_return` participants, the presence of an active
+    /// `is_return` participant triggers return-address hijacking, and a
+    /// trampoline hit delivers only to `is_return` participants (mirroring
+    /// Linux's handler/ret_handler split on the consumer).
+    pub fn is_return(&self) -> bool {
+        self.endpoint.is_return
     }
 }
 
@@ -225,6 +242,10 @@ struct UprobeDeliveryEndpoint {
     gate: UprobeAdmissionGate,
     callback: Option<Weak<dyn uprobe::CallBackFunc>>,
     task_scope: Option<UprobeTaskScope>,
+    /// Whether the consumer is a return probe (propagated through
+    /// [`UprobeConsumerRuntime`], exposed via snapshot's
+    /// [`UprobeConsumerRuntimeSnapshot::is_return`]).
+    is_return: bool,
 }
 
 struct UprobeConsumerEpoch {
@@ -240,6 +261,7 @@ impl UprobeConsumerEpoch {
                 gate: UprobeAdmissionGate::pending(),
                 callback: runtime.event_callback.as_ref().map(Arc::downgrade),
                 task_scope,
+                is_return: runtime.is_return,
             }),
         })
     }
@@ -304,6 +326,12 @@ impl UprobeConsumer {
         self.published_epoch.load().is_some()
     }
 
+    /// Whether this consumer is a return probe (uretprobe). The install path
+    /// (`site.rs`) uses this to ensure the trampoline exists before the
+    /// breakpoint is published (F6 arm ordering).
+    pub fn is_return(&self) -> bool {
+        self.runtime.is_return
+    }
     pub fn new(
         id: u64,
         definition: Arc<UprobeDefinition>,
@@ -401,6 +429,8 @@ pub struct UprobeConsumerReg {
     pub definition: Arc<UprobeDefinition>,
     pub scope: UprobeConsumerScope,
     pub event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
+    /// Whether this is a return probe (perf ABI: `config` bit0 = IS_RETPROBE).
+    pub is_return: bool,
     pub enabled: bool,
 }
 
@@ -535,6 +565,7 @@ pub fn uprobe_registry_add(
         },
         UprobeConsumerRuntime {
             event_callback: reg.event_callback.clone(),
+            is_return: reg.is_return,
         },
         reg.enabled,
     );

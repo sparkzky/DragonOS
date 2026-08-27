@@ -623,7 +623,26 @@ pub(super) fn uprobe_register_locked(
         }
     }
 
-    // ── Step 3: 创建 uprobe 实体 ──
+    // ── Step 2.5 (uretprobe): ensure the trampoline exists before the
+    // breakpoint is published ──
+    // F6 arm ordering: before an is_return participant's breakpoint becomes
+    // visible, the trampoline must already be in place, otherwise the hijack
+    // moment would read address 0. Failure rolls back the whole registration
+    // (same semantics as the existing P2 handling).
+    let fresh_trampoline_page = if consumer.is_return() {
+        match ensure_xol_trampoline(mm, inner, fresh_xol_page.as_ref()) {
+            Ok((_vaddr, page)) => page,
+            Err(e) => {
+                if let Some(page) = fresh_xol_page.as_ref() {
+                    drop(xol_lease);
+                    discard_unpublished_xol_page(mm, inner, page);
+                }
+                return Err(e.into());
+            }
+        }
+    } else {
+        None
+    };
     let first_site = existing_site.is_none();
     let site = existing_site.unwrap_or_else(|| {
         Arc::new(UprobeSite {
@@ -683,18 +702,32 @@ pub(super) fn uprobe_register_locked(
         consumer.forget_site(mm.id(), probe_vaddr, &site);
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
-        if let Some(page) = fresh_xol_page {
-            // No breakpoint was published, so this newly grown XOL page has
+        if fresh_trampoline_page.is_some() || fresh_xol_page.is_some() {
+            // No breakpoint was published, so any newly grown XOL page has
             // no external user. Drop every slot owner before removing the
             // exact kernel-owned VMA; failed registrations must not grow the
             // per-mm pool high-water mark.
             drop(site);
             drop(xol_lease);
+        }
+        // If the uretprobe trampoline happens to sit on a newly grown page,
+        // withdraw its address before dropping the page: no breakpoint was
+        // published, so no published is_return site in this mm references it
+        // yet and the withdrawal is safe.
+        if let Some(page) = fresh_trampoline_page {
+            mm.xol_pool.withdraw_trampoline_on_page(&page);
+            discard_unpublished_xol_page(mm, inner, &page);
+        }
+        if let Some(page) = fresh_xol_page {
+            mm.xol_pool.withdraw_trampoline_on_page(&page);
             discard_unpublished_xol_page(mm, inner, &page);
         }
         return Err(e);
     }
 
+    if let Some(page) = fresh_trampoline_page {
+        mm.xol_pool.add_page(page);
+    }
     if let Some(page) = fresh_xol_page {
         mm.xol_pool.add_page(page);
     }
@@ -746,10 +779,6 @@ fn ensure_xol_and_alloc_slot(
         return Ok((lease, None));
     }
 
-    // Reserve the collection entry before committing a new VMA. All callers
-    // own mm.write, so no competing registration can consume this capacity.
-    mm.xol_pool.reserve_page()?;
-
     // Select a whole-page hole whose base is itself reachable. Slot zero of
     // the fresh page is then guaranteed to satisfy the exact disp32 interval,
     // and MAP_FIXED_NOREPLACE below cannot silently fall back elsewhere.
@@ -772,10 +801,36 @@ fn ensure_xol_and_alloc_slot(
         .checked_sub(first)
         .and_then(|size| size.checked_add(MMArch::PAGE_SIZE))
         .ok_or(SystemError::ENOMEM)?;
-    let bounds = VirtRegion::new(VirtAddr::new(first), bounded_size);
+    let xol_page = grow_xol_pool(
+        mm,
+        inner,
+        VirtRegion::new(VirtAddr::new(first), bounded_size),
+    )?;
+    let lease = xol_page
+        .alloc_slot_in(reachable)
+        .map(Arc::new)
+        .expect("fresh reachable XOL page has no reachable slot");
+    Ok((lease, Some(xol_page)))
+}
+
+/// Grow the per-mm XOL pool by one page placed anywhere inside `hole_bounds`.
+///
+/// The returned page is NOT yet part of the pool: the caller adds it with
+/// [`XolPool::add_page`] after the registration succeeds, or discards it via
+/// [`discard_unpublished_xol_page`] on failure (failed registrations must not
+/// grow the pool high-water mark).
+fn grow_xol_pool(
+    mm: &Arc<AddressSpace>,
+    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    hole_bounds: VirtRegion,
+) -> Result<Arc<XolPage>, SystemError> {
+    // Reserve the collection entry before committing a new VMA. All callers
+    // own mm.write, so no competing registration can consume this capacity.
+    mm.xol_pool.reserve_page()?;
+
     let region = inner
         .mappings
-        .find_free_bounded(bounds, MMArch::PAGE_SIZE)
+        .find_free_bounded(hole_bounds, MMArch::PAGE_SIZE)
         .ok_or(SystemError::ENOMEM)?;
 
     // Slow path: create another anonymous read/execute page. map_anonymous may
@@ -820,12 +875,60 @@ fn ensure_xol_and_alloc_slot(
         pm.get(&page_paddr)
             .expect("fresh XOL page is absent from the page manager")
     };
-    let xol_page = XolPage::new(page.virt_address(), page_paddr, owned_page);
-    let lease = xol_page
-        .alloc_slot_in(reachable)
-        .map(Arc::new)
-        .expect("fresh reachable XOL page has no reachable slot");
-    Ok((lease, Some(xol_page)))
+    Ok(XolPage::new(page.virt_address(), page_paddr, owned_page))
+}
+
+/// Ensure the uretprobe trampoline exists (install path for is_return
+/// consumers; caller holds mm.write).
+///
+/// F6 arm ordering: the trampoline must be visible before any is_return
+/// breakpoint, hence this runs before this registration's site is published;
+/// on failure the whole registration is rolled back.
+///
+/// Returns `(trampoline_vaddr, fresh_page)`. Lookup order (lazy any-slot
+/// scheme, review F2):
+/// 1. any free slot on an existing pool page (reachable window ignored — the
+///    return address is an absolute 8-byte value);
+/// 2. the page freshly grown by this registration for the probe slot (reaching
+///    this point means the pool has no free slot left);
+/// 3. grow one more page (any whole-page user-space hole).
+///
+/// A page grown in case 3 is not yet part of the pool: on success the caller
+/// `add_page`s it; on failure, first
+/// [`XolPool::withdraw_trampoline_on_page`], then `discard_unpublished_xol_page`.
+fn ensure_xol_trampoline(
+    mm: &Arc<AddressSpace>,
+    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    fresh_probe_page: Option<&Arc<XolPage>>,
+) -> Result<(usize, Option<Arc<XolPage>>), SystemError> {
+    if let Ok(vaddr) = mm.xol_pool.ensure_trampoline() {
+        return Ok((vaddr, None));
+    }
+    if let Some(page) = fresh_probe_page {
+        if let Ok(vaddr) = mm.xol_pool.install_trampoline_on_fresh(page) {
+            return Ok((vaddr, None));
+        }
+    }
+
+    let page_mask = MMArch::PAGE_SIZE - 1;
+    let first = inner
+        .mmap_min
+        .data()
+        .checked_add(page_mask)
+        .map(|addr| addr & !page_mask)
+        .ok_or(SystemError::ENOMEM)?;
+    let size = MMArch::USER_END_VADDR
+        .data()
+        .checked_sub(first)
+        .ok_or(SystemError::ENOMEM)?;
+    let page = grow_xol_pool(mm, inner, VirtRegion::new(VirtAddr::new(first), size))?;
+    match mm.xol_pool.install_trampoline_on_fresh(&page) {
+        Ok(vaddr) => Ok((vaddr, Some(page))),
+        Err(e) => {
+            discard_unpublished_xol_page(mm, inner, &page);
+            Err(e)
+        }
+    }
 }
 
 /// Remove an XOL VMA which was created for an installation that never

@@ -7,8 +7,9 @@ use crate::bpf::helper::print::trace_printf;
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
+use crate::mm::{access_ok, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::copy_from_user_protected;
 use crate::time::Instant;
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ffi::c_void;
@@ -116,6 +117,30 @@ fn raw_bpf_probe_read(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) ->
 pub fn bpf_probe_read(dst: &mut [u8], src: &[u8]) -> Result<()> {
     // log::info!("bpf_probe_read: len: {}", dst.len());
     dst.copy_from_slice(src);
+    Ok(())
+}
+
+/// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_probe_read_user/
+unsafe fn raw_probe_read_user(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
+    let res = probe_read_user(
+        core::slice::from_raw_parts_mut(dst as *mut u8, size as usize),
+        VirtAddr::new(unsafe_ptr as usize),
+    );
+    match res {
+        Ok(_) => 0,
+        Err(e) => e.to_posix_errno() as i64,
+    }
+}
+
+/// For tracing programs, safely attempt to read size
+/// bytes from user space address unsafe_ptr and
+/// store the data in dst.
+pub fn probe_read_user(dst: &mut [u8], src: VirtAddr) -> Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    access_ok(src, dst.len())?;
+    unsafe { copy_from_user_protected(dst, src)? };
     Ok(())
 }
 
@@ -327,17 +352,56 @@ unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *cons
     let res = probe_read_user_str(dst, unsafe_ptr as *const u8);
     match res {
         Ok(len) => len as i64,
-        Err(e) => e as i64,
+        Err(e) => e.to_posix_errno() as i64,
     }
 }
 
 pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
-    let str = check_and_clone_cstr(src, None).unwrap();
-    let len = str.as_bytes().len();
-    let copy_len = len.min(dst.len() - 1); // Leave space for NULL terminator
-    dst[..copy_len].copy_from_slice(&str.as_bytes()[..copy_len]);
-    dst[copy_len] = 0; // Null-terminate the string
-    Ok(copy_len + 1) // Return length including NULL terminator
+    // The destination buffer length includes the trailing NUL byte; when it is
+    // 0 there is nothing to copy (returns 0, matching Linux).
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    // Read from user space and search for NUL chunk by chunk in protected
+    // fashion: a bad pointer only yields EFAULT instead of panicking the
+    // kernel with a page fault like a direct dereference would.
+    let src = VirtAddr::new(src as usize);
+    let mut chunk = [0u8; 64];
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let step = chunk.len().min(dst.len() - copied);
+        let cur = src + copied;
+        if unsafe { copy_from_user_protected(&mut chunk[..step], cur) }.is_ok() {
+            if let Some(pos) = chunk[..step].iter().position(|&b| b == 0) {
+                // NUL found: copy it along with the string, no extra padding.
+                dst[copied..copied + pos + 1].copy_from_slice(&chunk[..pos + 1]);
+                return Ok(copied + pos + 1);
+            }
+            dst[copied..copied + step].copy_from_slice(&chunk[..step]);
+            copied += step;
+        } else {
+            // Whole-chunk read failed: the chunk tail may merely cross into an
+            // unmapped page. To avoid a spurious EFAULT when the string happens
+            // to end at a page boundary, retry this chunk byte by byte; a truly
+            // bad pointer will still surface as EFAULT in the byte-wise read.
+            for i in 0..step {
+                let mut byte = [0u8; 1];
+                unsafe { copy_from_user_protected(&mut byte, cur + i)? };
+                dst[copied + i] = byte[0];
+                if byte[0] == 0 {
+                    return Ok(copied + i + 1);
+                }
+            }
+            copied += step;
+        }
+    }
+
+    // No NUL anywhere in the buffer: truncate, keep only size-1 bytes, and
+    // terminate with NUL.
+    let last = dst.len() - 1;
+    dst[last] = 0;
+    Ok(dst.len())
 }
 
 pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new();
@@ -378,6 +442,10 @@ pub fn init_helper_functions() {
         map.insert(HELPER_MAP_PEEK_ELEM, define_func!(raw_map_peek_elem));
 
         // User access helpers
+        map.insert(
+            HELPER_BPF_PROBE_READ_USER,
+            define_func!(raw_probe_read_user),
+        );
         map.insert(
             HELPER_PROBE_READ_USER_STR,
             define_func!(raw_probe_read_user_str),

@@ -393,9 +393,27 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     if args.read_format != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    if args.config != PerfProbeConfig::Raw(0) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
+    // uretprobe ABI (mirrors the Linux uprobe PMU): config bit0 = IS_RETPROBE,
+    // Raw(0) = uprobe, Raw(1) = uretprobe. Any other value is rejected with
+    // EOPNOTSUPP — including the ref_ctr field at bit32 onward, which gets an
+    // explicit log saying it is unsupported.
+    let is_return = match args.config {
+        PerfProbeConfig::Raw(0) => false,
+        PerfProbeConfig::Raw(1) => true,
+        PerfProbeConfig::Raw(bits) => {
+            // Linux PERF_UPROBE_REF_CTR_SHIFT = 32。
+            if bits >> 32 != 0 {
+                log::warn!(
+                    "uprobe: ref_ctr (config bits 32.., value {:#x}) is not supported",
+                    bits >> 32
+                );
+            }
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        PerfProbeConfig::PerfSwIds(_) => {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+    };
 
     // Linux uprobe PMU ABI uses config1 exclusively for the pathname and
     // config2 exclusively for the file offset.  Do not reinterpret ':' in a
@@ -462,6 +480,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             definition,
             scope,
             event_callback: Some(callback.clone()),
+            is_return,
             // Initial activation uses the same scope-aware path as ioctl
             // ENABLE, so task events never need a global file-rmap scan.
             enabled: false,
