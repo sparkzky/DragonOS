@@ -217,6 +217,15 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 期间自动 `stall_watchdog` 抓到多次 `TASK DUMP`（62~64 任务）：dockerd/containerd 停在 `LSYSCALL=202`(futex)，`virtio_blk_io_0 Blocked(false)`、`page_reclaim`/`vfs_writeback`/`ext4_journal`/`ext4_evict` 全阻塞——IO 侧一过性停摆，多数可自恢复。
 - 待办：① 在 `complete_used_requests` 的 NotReady/EIO 与 `submit_bio` 失败点加一次性 critical（含 token/sector/op）定位 EIO 来源；② 若确认 virtio 队列复位丢完成，则按 #2515 的超时自检触发重试/重初始化。
 
+### 3.9 时钟降级后「假挂死」根因（2026-10-23 定位并修复）
+- 现场：`docker load` 期间串口出现 `tksetup: install 'acpi_pm'`（kvm-clock 被降级，降级路径**工作正常**），随后 20 分钟宿主磁盘零写入、guest CPU 4%、console 无响应。
+- 关键日志：
+  - `invdet: now=2034942 last=6815097 raw=0xb70f85 mask=0xffffff max=0xffffff`（`last` 两次采样不变，`now` 在前进）
+  - 持续 `deadline tick on cpu0/1: monotonic clock regressed (...); re-anchoring`
+- 根因：`timekeeping::clocksource_delta()` 用 `raw > mask >> 1` 判定"读数回退"并返回 0。**acpi_pm 是 24 位掩码**，窗口仅 `2^24/3.579545MHz ≈ 4.69s`；任何 >2.34s 的合法前向间隔（中断关闭、负载停摆）都被误判为回退，单调钟被钳 0 数秒、deadline tick 反复 re-anchor，表现为系统假死。本例 `raw=0xb70f85=12,001,061 > 0x7fffff`，正是一次跨 24 位回绕的正常前向间隔（3.35s）。
+- 修复：对齐 Linux 6.6 `timekeeping_get_delta()` —— **不做方向推断**，统一 `raw.min(max_cycles)`；`max_cycles=min(u64::MAX/max_mult, mask)` 已把单次跳变限制在秒级。持续性倒走仍由 `active_clocksource_regressed()` watchdog 自检触发降级重选（每 64 次超窗读数唤醒一次）。
+- 附带修正：`invdet` 打印格式参数错位（`mask=` 为空），改为只打印 `now/last/raw/max`。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
