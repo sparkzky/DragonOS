@@ -136,7 +136,8 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
   - mysql entrypoint 第 261 行用了 `--defaults-extra-file=<( _mysql_passfile ... )`（process substitution），因此初始化必崩。
   - 机理（二次修正，已到指令级）：`/dev/fd -> /proc/self/fd` 存在，简单 pipe 重打开正常（`echo hi|{ cat;echo A=$?;cat /dev/fd/0;echo B=$?; }` → `hi/A=0/B=0`）。崩溃发生在 **bash 解析/展开 `<(...)` 阶段**（连 `echo B` 都未执行）。
   - 指令级定位：PIE 二进制在 DragonOS 上统一加载于基址 `0x10000`（由 `/proc/self/maps` 证实），故崩溃 `rip=0x65451` ⇒ 文件偏移 `0x55451`，落在 **`initialize_flags`+0x71** 的 `mov 0x8(%rdi),%esi`（此时 `rdi=0` ⇒ 读地址 0x8）。寄存器 `rax/rdi/rsi/rdx` 全零，说明进入该点的调用/返回状态已被破坏（非正常参数路径）。
-  - 下一步（两条并行）：① `bash -c 'echo B;/bin/true;echo A'` 与 `bash -c 'echo B;/bin/echo X;echo A'`——若同样崩溃，则问题在 **bash fork/vfork 执行外部命令** 的 TrapFrame 复制路径，而非 process substitution 专有；② 用 QEMU `-d int` 追崩溃进程最后一次 `syscall/信号返回`，区分 fork TrapFrame 与 `rt_sigreturn` 恢复帧损坏。注意容器 stdout 经 docker 捕获偶有丢失，判定时优先用「命令后 `echo 标记`」或写入文件再读。
+  - **排除 vfork/外部命令路径**（2026-10-23 实测）：`bash -c 'echo B;/bin/true;echo A'` → `RC=0` 正常。
+  - **新证据（指向输出/管道）**：`bash -c 'echo B;/bin/echo X;echo A'`（外部命令写 stdout）**挂住不返回**（>3 分钟，Ctrl+C 无效）。说明问题在容器 stdout/管道写路径（与 2-e“docker run 挂起”同域），而非 bash fork/exec。下一步优先排查匿名管道写阻塞/唤醒（pipe 写满或丢失唤醒），再回到 case3（process substitution）。
   - 修复方向：为 `/proc/<pid>/fd/N` 实现 Linux `proc_fd_link` 语义——`special_node()` 返回目标文件，`open` 时**复制文件描述**（同一 pipe 端），使 process substitution 可用。
 - ✅ **阻断 1 pinpoint 已取得**：`tlb: ... via flush_tlb_mm_range at src/mm/fault.rs:1206` 与 `:1223`（COW/写时复制缺页路径同步 shootdown）。修法：gather 后延迟 flush，或内核态原子区 fault 不发起同步 shootdown。
 - ✅ **阻断 4 本轮未复现**：futex 修复后 `docker load` 完整跑完（`Loaded image`、`LOAD_RC=0`），自制 `vblk stall` 自检零命中。块 IO 停顿很可能是 futex 持锁睡眠的下游。
