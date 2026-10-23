@@ -305,6 +305,14 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 修复：新增 `vfs::mount::shutdown_mounted_filesystems()`（`git 8d93771f`）——对每个可写挂载执行 `sync_fs(wait)` 后调用 `FileSystem::on_umount()`；ext4 的 `on_umount` 已是 `flush_dirty_inodes + journal.shutdown + shutdown_writable()`（清 RECOVER）。在 `kernel_shutdown_prepare()` 中 `device_shutdown()` 之前调用。
 - 实测（#196 / 12G / seed 盘）：启动 → `dragon-docker-start` → `docker run redis` → `busybox poweroff -f` → 再次启动 **无 `dirty journal detected`**，`docker images` 仍为 8 个镜像。
 
+### 3.19 bash 子进程崩溃：已排除项与下一步（2026-10-24）
+- 复现矩阵（#196，干净关机可复用盘）：
+  - 根 shell：`for i in $(seq 1 200); do x=$(true); done` -> DONE1；`readarray -t A < <(printf a)` x50 -> DONE2。
+  - 容器内（clickhouse 镜像 bash）：`$(id -u) $(id -g)`、`readarray < <(seq 3)`、`readarray < <(clickhouse extract-from-config ...)` 均正常。
+  - 仅完整 `/entrypoint.sh` 崩溃（第二个 `readarray ... < <(...)` 之后），内核日志特征：`rip=0x67ca1, address=0x8, rax/rdi/rsi/rdx=0, rsp≈0x6ffff09ff0xx`（多次采样落在同一小区间）。
+- 已核对并排除：`copy_thread` 正确复制父 TrapFrame 并清零 rax；syscall 入口帧布局与 `ret_from_intr`/`iretq` 一致；`CLONE_VFORK` 已实现父进程阻塞（`do_clone` 中 `wait_for_completion_killable`，exit/exec 时 complete）。
+- 下一步（需内核探针）：在子进程首次返回用户态前按 pid 采样一次 TrapFrame 的 rip/rsp/rdi/rsi/rdx，与 fork 时父帧对比；同时记录 `%fs` base（0x67ca1 附近使用 `%fs:0x28` 栈金丝雀，若 FS base=0 则读地址 0x28）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
