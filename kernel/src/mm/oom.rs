@@ -16,7 +16,7 @@ use crate::{
     ipc::signal::PreparedOomSigkill,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
+    process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
 };
 
 use super::ucontext::AddressSpace;
@@ -720,6 +720,36 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
     )
 }
 
+
+/// OOM 选择彻底失败（通常是内核堆耗尽：snapshot_all_processes/try_reserve 自身
+/// 分配失败返回 Err，或全局无候选/提交失败）时的兜底路径。
+///
+/// 对齐 Linux `oom_kill_process(current)` 语义：直接 SIGKILL 触发缺页的进程本身。
+///
+/// 零分配保证（堆耗尽下的硬性要求）：
+/// - 全程不使用 error!/warn! 等日志宏——Logger 内部 `to_string()` 需要堆分配，
+///   会在杀掉进程之前先触发 global_alloc_error；现场输出走
+///   `emergency_print_noalloc`（直写 COM1，无锁无堆）；
+/// - SIGKILL 走 send_signal 的 fast path（仅置位 pending 位图并唤醒）；
+/// - 若通用路径仍失败，退化为 `queue_private_sigkill_to_thread`：对当前线程
+///   置位 private SIGKILL 位图 + recalc + 致命唤醒，同样零堆分配。
+pub(crate) fn oom_kill_trigger_fallback(ctx: &OomContext) -> bool {
+    let current = ProcessManager::current_pcb();
+    crate::libs::printk::emergency_print_noalloc("[oom-fallback] kill trigger tgid=");
+    crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_tgid.data() as u64);
+    crate::libs::printk::emergency_print_noalloc(" pid=");
+    crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_pid.data() as u64);
+    crate::libs::printk::emergency_print_noalloc("\n");
+    if Signal::SIGKILL
+        .send_signal_info_to_pcb(None, current.clone(), PidType::TGID)
+        .is_err()
+    {
+        // 通用交付路径失败（如其中某个子步骤仍需内存）：直接对当前线程
+        // 置位 private SIGKILL 并致命唤醒，只做位图与调度器操作。
+        Signal::queue_private_sigkill_to_thread(&current);
+    }
+    true
+}
 pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     loop {
         if current_is_killed_or_exiting() {
@@ -738,13 +768,18 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
             Ok(OomSelection::Candidate(candidate)) => candidate,
             Ok(OomSelection::None | OomSelection::ExistingVictim(_)) | Err(_) => {
                 finish_selection_none();
-                error!(
-                    "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
-                    ctx.trigger_pid,
-                    ctx.trigger_tgid,
-                    ctx.fault_address.data(),
-                    ctx.fault_ip
-                );
+                // 堆耗尽路径：日志宏内部需要堆分配（to_string），只能走零分配
+                // 紧急串口通道，否则会在杀进程前先触发 global_alloc_error。
+                crate::libs::printk::emergency_print_noalloc("[oom] no victim for trigger tgid=");
+                crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_tgid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc(" pid=");
+                crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_pid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc("\n");
+                // 选择失败不允许上抛成内核 panic：Err 通常是堆耗尽导致
+                // snapshot/try_reserve 自身分配失败，退化为杀触发进程本身。
+                if oom_kill_trigger_fallback(&ctx) {
+                    return OomOutcome::CurrentTaskKilled;
+                }
                 return OomOutcome::NoVictim;
             }
         };
@@ -755,25 +790,22 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
             || (task_uses_mm(&current, &candidate.mm)
                 && !is_global_init_or_kthread(&current_leader));
         let candidate_tgid = candidate.tgid;
-        let victim_score = candidate.score;
-        let victim_oom_score_adj = candidate.oom_score_adj;
         let victim_resident_pages = candidate.resident_pages;
         match send_oom_sigkill(generation, &candidate, None, 0) {
             Ok(killed) => {
                 finish_selection_none();
                 count_oom_kill();
-                error!(
-                        "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
-                        ctx.trigger_pid,
-                        ctx.trigger_tgid,
-                        killed.tgid,
-                        victim_score,
-                        victim_oom_score_adj,
-                        victim_resident_pages,
-                        ctx.order,
-                        ctx.fault_address.data(),
-                        ctx.fault_ip
+                // 成功杀掉了 victim，但此刻堆可能仍耗尽：这里同样不能使用
+                // error!（其 to_string 分配失败会让 OOM 流程中途停车）。
+                crate::libs::printk::emergency_print_noalloc(
+                    "[oom-kill] trigger_tgid=",
                 );
+                crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_tgid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc(" victim_tgid=");
+                crate::libs::printk::emergency_print_u64_noalloc(killed.tgid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc(" rss_pages=");
+                crate::libs::printk::emergency_print_u64_noalloc(victim_resident_pages as u64);
+                crate::libs::printk::emergency_print_noalloc("\n");
                 drop(candidate);
                 if current_is_victim {
                     return OomOutcome::CurrentTaskKilled;
@@ -793,12 +825,19 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 finish_selection_none();
                 continue;
             }
-            Err(err) => {
+            Err(_err) => {
                 finish_selection_none();
-                warn!(
-                    "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
-                    candidate_tgid, ctx.trigger_pid, err
-                );
+                // 堆耗尽下 warn! 自身会分配，改走零分配紧急串口。
+                crate::libs::printk::emergency_print_noalloc("[oom] sigkill victim failed victim_tgid=");
+                crate::libs::printk::emergency_print_u64_noalloc(candidate_tgid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc(" for trigger pid=");
+                crate::libs::printk::emergency_print_u64_noalloc(ctx.trigger_pid.data() as u64);
+                crate::libs::printk::emergency_print_noalloc("\n");
+                // 提交失败（多为准备阶段分配失败）：同样退化为杀触发进程，
+                // 而不是让缺页路径 panic。
+                if oom_kill_trigger_fallback(&ctx) {
+                    return OomOutcome::CurrentTaskKilled;
+                }
                 return OomOutcome::NoVictim;
             }
         }
