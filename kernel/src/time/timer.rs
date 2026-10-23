@@ -26,6 +26,10 @@ const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
+/// 当前 jiffies 计数（供停摆取证等调试设施读取）
+pub(crate) fn timer_jiffies_value() -> u64 {
+    TIMER_JIFFIES.load(Ordering::SeqCst)
+}
 lazy_static! {
     pub static ref TIMER_LIST: SpinLock<BTreeMap<(u64, usize), Arc<Timer>>> =
         SpinLock::new(BTreeMap::new());

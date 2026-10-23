@@ -998,7 +998,19 @@ impl Waker {
                         .is_ok()
                     {
                         if let Some(pcb) = self.data().target.upgrade() {
-                            let _ = ProcessManager::wakeup(&pcb);
+                            if let Err(e) = ProcessManager::wakeup(&pcb) {
+                                static WK_FAILS: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                if WK_FAILS.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+                                    crate::print_critical!(
+                                        "WKFAIL(idle) n={} pid={} state={:?} err={:?}\n",
+                                        WK_FAILS.load(Ordering::Relaxed),
+                                        pcb.raw_pid().data(),
+                                        pcb.sched_info().state(),
+                                        e
+                                    );
+                                }
+                            }
                         }
                         return true;
                     }
@@ -1016,7 +1028,19 @@ impl Waker {
                         .is_ok()
                     {
                         if let Some(pcb) = self.data().target.upgrade() {
-                            let _ = ProcessManager::wakeup(&pcb);
+                            if let Err(e) = ProcessManager::wakeup(&pcb) {
+                                static WK_FAILS2: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                if WK_FAILS2.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+                                    crate::print_critical!(
+                                        "WKFAIL(sleep) n={} pid={} state={:?} err={:?}\n",
+                                        WK_FAILS2.load(Ordering::Relaxed),
+                                        pcb.raw_pid().data(),
+                                        pcb.sched_info().state(),
+                                        e
+                                    );
+                                }
+                            }
                         }
                         return true;
                     }

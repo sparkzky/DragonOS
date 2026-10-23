@@ -4,13 +4,14 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{
     alloc::AllocError,
     fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[path = "deadline_queue.rs"]
 mod queue;
 use queue::{DeadlineQueue, Node};
 use system_error::SystemError;
+use log::warn;
 
 use super::{clocksource::HZ, tick_common::tick_handle_periodic, timekeeping};
 use crate::{
@@ -29,6 +30,67 @@ static CAPABLE: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
 static QUEUES: [SpinLock<Queue>; PerCpu::MAX_CPU_NUM as usize] =
     [const { SpinLock::new(Queue::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
+// R4 诊断：deadline 子系统级武装/分类探针（critical 通道，楔死现场可用）。
+// 分类：0=外部 arm() 武装，1=expire 回调续排，2=非 tick 到期，3=tick 服务。
+// 1 秒窗口内事件数达到 512 时输出一行分解（1250/s 风暴也会触发）；
+// 正常运行（事件 < 512/s）零输出、零开销（每事件一次原子加）。
+static PROBE_WINDOW: AtomicU64 = AtomicU64::new(0);
+static PROBE_WINDOW_EVENTS: AtomicU64 = AtomicU64::new(0);
+static PROBE_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static PROBE_LAST_ARM_DELTA: AtomicU64 = AtomicU64::new(0);
+static PROBE_LAST_TICK_DELTA: AtomicU64 = AtomicU64::new(0);
+static PROBE_LAST_FIRST_DELTA: AtomicU64 = AtomicU64::new(0);
+static PROBE_LAST_PEND: AtomicU64 = AtomicU64::new(0);
+static PROBE_LAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
+/// 每 CPU 见过的最大 now_ns（时钟倒走检测）。
+static LAST_NOW: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+
+static PROBE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// 探针打印编译期开关。dl_probe 位于 deadline IRQ 的关中断路径，直写串口
+/// 会在 IF=0 区间占用数 ms（R16 已定罪此类"console in irq-off"缺陷），
+/// 生产/验收默认关闭；需要诊断时改为 true。
+const DL_PROBE_PRINT: bool = false;
+
+fn dl_probe(kind: usize) {
+    let now = now_ns();
+    let window = PROBE_WINDOW.load(Ordering::Relaxed);
+    let total = PROBE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    // 触发条件双保险：窗口内第 512 个事件，或累计每 2048 个事件。
+    // 后者是 now_ns() 冻结时的兜底——冻结的时钟会让窗口永不翻转，
+    // 纯窗口逻辑（R4 版）在风暴中零输出。
+    let fire = if now.saturating_sub(window) > 1_000_000_000 {
+        PROBE_WINDOW.store(now, Ordering::Relaxed);
+        PROBE_WINDOW_EVENTS.store(1, Ordering::Relaxed);
+        false
+    } else {
+        PROBE_WINDOW_EVENTS.fetch_add(1, Ordering::Relaxed) + 1 == 512
+    } || total % 2048 == 0;
+    if fire && DL_PROBE_PRINT {
+        crate::print_critical!(
+            "dlprobe cpu={} tot={} arm={} rearm={} non_tick={} tick={} arm_in={}ns tick_in={}ns first_in={}ns pend={} fb={} now32={:#x}\n",
+            smp_get_processor_id().data(),
+            total,
+            PROBE_COUNTS[0].load(Ordering::Relaxed),
+            PROBE_COUNTS[1].load(Ordering::Relaxed),
+            PROBE_COUNTS[2].load(Ordering::Relaxed),
+            PROBE_COUNTS[3].load(Ordering::Relaxed),
+            PROBE_LAST_ARM_DELTA.load(Ordering::Relaxed),
+            PROBE_LAST_TICK_DELTA.load(Ordering::Relaxed),
+            PROBE_LAST_FIRST_DELTA.load(Ordering::Relaxed),
+            PROBE_LAST_PEND.load(Ordering::Relaxed),
+            PROBE_LAST_FALLBACK.load(Ordering::Relaxed),
+            now & 0xffff_ffff
+        );
+    }
+    PROBE_COUNTS[kind].fetch_add(1, Ordering::Relaxed);
+}
+
+/// QUEUES 的原始地址（仅供停摆取证离线解析，不提供语义）
+pub(crate) fn queues_raw_addr() -> usize {
+    &QUEUES as *const _ as usize
+}
 type Key = (u64, usize);
 #[derive(Debug)]
 struct Pending {
@@ -128,6 +190,8 @@ impl DeadlineEvent {
             });
         }
         queue.pending.insert(node);
+        PROBE_LAST_ARM_DELTA.store(key.0.saturating_sub(now_ns()), Ordering::Relaxed);
+        dl_probe(0);
         state.queued = Some(key);
         if self.owner == smp_get_processor_id() {
             program_locked(&queue);
@@ -274,7 +338,40 @@ pub fn handle_irq(frame: &TrapFrame) {
     let tick = {
         let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
         let now = now_ns();
-        if fallback {
+        // 时钟倒走检测：now 比本 CPU 见过的最大值倒退超过一个 tick，
+        // 说明单调钟正在持续回退（如 KVM 负载下 pvclock 倒走）。此时
+        // next_tick（按旧时刻排的）相对 now 恒在“未来”，正常分支与远期
+        // 重锚分支都覆盖不了“next_tick 合理而 now 在退”的形态。以当前
+        // （倒走中的）now 重锚并继续服务 tick，保证 jiffies 与 timer
+        // wheel 在时钟源切换（watchdog 强制重选）落地前保持存活。
+        let last = LAST_NOW[cpu.data() as usize].load(Ordering::Relaxed);
+        let regressed = now.saturating_add(TICK_NS) < last;
+        LAST_NOW[cpu.data() as usize].store(now.max(last), Ordering::Relaxed);
+        PROBE_LAST_FALLBACK.store(fallback as u64, Ordering::Relaxed);
+        PROBE_LAST_TICK_DELTA.store(queue.next_tick.saturating_sub(now), Ordering::Relaxed);
+        PROBE_LAST_FIRST_DELTA.store(
+            queue
+                .pending
+                .first_key()
+                .map_or(u64::MAX, |key| key.0.saturating_sub(now)),
+            Ordering::Relaxed,
+        );
+        PROBE_LAST_PEND.store(queue.pending.len() as u64, Ordering::Relaxed);
+        if regressed {
+            warn!(
+                "deadline tick on cpu{}: monotonic clock regressed (now={}, last={}); re-anchoring",
+                cpu.data(),
+                now,
+                last
+            );
+            // 双路唤醒保障：delta 守卫路径之外，deadline 层（本层在风暴中
+            // 实测仍在运行）直接唤醒 clocksource watchdog 执行强制重选。
+            crate::time::clocksource::run_watchdog_kthread();
+            queue.next_tick = now.saturating_add(TICK_NS);
+            dl_probe(3);
+            true
+        } else if fallback {
+            dl_probe(3);
             true
         } else if now >= queue.next_tick {
             // Tick classification is sampled once, not guessed for the missed
@@ -283,8 +380,26 @@ pub fn handle_irq(frame: &TrapFrame) {
             queue.next_tick = queue
                 .next_tick
                 .saturating_add(periods.saturating_mul(TICK_NS));
+            dl_probe(3);
+            true
+        } else if queue.next_tick > now.saturating_add(TICK_NS) {
+            // 正常路径下每次服务后 next_tick 总落在 (now, now+TICK_NS] 内，
+            // 出现远期期限只能是单调时钟读数异常（一次前跳读数）留下的过期
+            // 绝对期限。继续等待会以 u32::MAX 计数反复重编 one-shot，tick
+            // 永停（jiffies 冻结、timer wheel 全灭）。对标 Linux
+            // tick_sched_timer/hrtimer_forward(now, period) 的锚定语义：以
+            // 当前时间为锚点重新排程并立即服务一个 tick。
+            warn!(
+                "deadline tick on cpu{}: stale next_tick {}ns is far beyond now {}ns; re-anchoring",
+                cpu.data(),
+                queue.next_tick,
+                now
+            );
+            queue.next_tick = now.saturating_add(TICK_NS);
+            dl_probe(3);
             true
         } else {
+            dl_probe(2);
             false
         }
     };
@@ -358,6 +473,8 @@ fn finish_callback(event: &Arc<DeadlineEvent>, generation: u64, now: u64) {
             generation,
         });
         queue.pending.insert(node);
+        PROBE_LAST_ARM_DELTA.store(key.0.saturating_sub(now_ns()), Ordering::Relaxed);
+        dl_probe(1);
         state.queued = Some(key);
     }
 }

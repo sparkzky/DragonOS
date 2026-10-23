@@ -40,12 +40,22 @@ impl Node {
 
 pub(super) struct DeadlineQueue {
     root: Option<Box<Node>>,
+    count: usize,
 }
 
 impl DeadlineQueue {
     pub(super) const fn new() -> Self {
-        Self { root: None }
+        Self {
+            root: None,
+            count: 0,
+        }
     }
+
+    /// 队列内节点数（诊断探针用，增量维护，O(1)）。
+    pub(super) fn len(&self) -> usize {
+        self.count
+    }
+
 
     #[cfg(test)]
     pub(super) fn validate(&self) -> usize {
@@ -87,11 +97,15 @@ impl DeadlineQueue {
     pub(super) fn insert(&mut self, node: Box<Node>) {
         assert!(node.left.is_none() && node.right.is_none() && node.height == 1);
         self.root = Some(Self::insert_node(self.root.take(), node));
+        self.count += 1;
     }
 
     pub(super) fn remove(&mut self, key: &Key) -> Option<Box<Node>> {
         let (root, removed) = Self::remove_node(self.root.take(), *key);
         self.root = root;
+        if removed.is_some() {
+            self.count -= 1;
+        }
         removed
     }
 
@@ -99,6 +113,7 @@ impl DeadlineQueue {
         let root = self.root.take()?;
         let (root, first) = Self::remove_min(root);
         self.root = root;
+        self.count -= 1;
         Some(first)
     }
 
