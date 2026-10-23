@@ -174,7 +174,9 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 **早前批次 PR 状态（2026-10-23 核查）**：#2479-#2483 已合并；#2484 OOM 仍 OPEN；#2490 clocksource **已合并**；#2491（APIC delta 告警）**CLOSED 且内容未进 master**；#2492（idle kick）**CLOSED**（enqueue 抢占评估已在 master，但 idle STI;HLT 仍缺）；#2493 诊断基建**已合并**；#2494 vcore **已合并**；#2495（R15 修复）按用户要求 CLOSED。
 
-**拆分与 PR**：上述修复正在拆分为独立分支/PR，明细（分支名、PR 号、合入状态、对应修复内容）记录于 `docs/ocmanager-porting/pr-split-2026-10-23.md`（由 PR 拆分任务生成/维护）。历史批次（#2479-#2495）的合入情况也一并记录在该文档。
+**拆分与 PR（2026-10-23 完成）**：已拆为 9 个独立 PR：**#2507** xattr EOPNOTSUPP、**#2508** run-qemu 端口、**#2509** fault 诊断、**#2510** panic stop_this_cpu、**#2511** TLB shootdown 上下文+liveness+track_caller、**#2512** idle STI;HLT（含 enqueue 守卫）、**#2513** APIC delta 告警、**#2514** 探针治理+tmict 采样修正、**#2515** virtio-blk 停顿自检。
+- **futex 持锁睡眠未开 PR**：上游 master 的 `futex_wait()` 已实现 `read_user_u32_nofault` 锁内复查 + 缺页放锁重试（与本次本地修复等价），重复提交会冲突；本地版本随 worktree 保留，rebase 时应采用上游实现。
+- 明细（分支、SHA、逐文件覆盖审计、历史 PR 状态、未修复清单）见 `docs/ocmanager-porting/pr-split-2026-10-23.md`。
 
 ---
 
