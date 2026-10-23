@@ -1119,8 +1119,16 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // debug!("set_unstable");
             // 误差过大，标记为unstable
-            info!("cs_dev_nsec = {}", cs_dev_nsec);
-            info!("wd_dev_nsec = {}", wd_dev_nsec);
+            // 降级判定必须可见：运行期 info! 可能被日志级别过滤，
+            // 这里走 critical 通道（watchdog 在进程/定时器上下文，非锁内）。
+            crate::print_critical!(
+                "wdt unstable: cs={} ({}) wd={} ({}) diff={}\n",
+                cs_dev_nsec,
+                cs_data.name,
+                wd_dev_nsec,
+                wd_now_data.name,
+                cs_dev_nsec.abs_diff(wd_dev_nsec)
+            );
             cs.mark_unstable_from_watchdog(
                 cs_dev_nsec
                     .abs_diff(wd_dev_nsec)
