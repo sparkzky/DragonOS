@@ -183,10 +183,16 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 |---|---|---|---|
 | MySQL | mysql:8.0.35 | 直接 `mysqld`（绕开 entrypoint 的 bash `<(...)` 缺陷） | ✅ `ready for connections`（3306）；`select version()` → `8.0.35` |
 | Redis | redis:7.2.3-alpine | `docker load` → `docker run -d` → `docker exec redis-cli ping` | ✅ `PONG`（L1=0/L2=0/R1=0/R2=0） |
-| ZooKeeper / Kafka | — | 主机无镜像，registry 拉取已知会卡死 | ⏳ 待获取镜像（save/load 旁路） |
+| ZooKeeper | zookeeper:3.8.3（官方，替代已下架的 bitnami 标签） | `docker load` | ✅ LOAD=0 |
+| Kafka | confluentinc/cp-kafka:7.5.0（替代 bitnami/kafka） | `docker load` | ❌ **挂死**：load 中途停止写盘（10 分钟盘镜像零增长），Ctrl+C 无法中断，与 2-e 同类的运行时楔死 |
+| ClickHouse | clickhouse-server:23.8.8.20 | 未开始 | ⏸ 排在 kafka 之后 |
 
 - 所有容器操作都在净盘 + 注入 tar（`/mysql8035.tar.gz`、`/redis72.tar.gz`）后进行；`docker load` 全程无挂死。
 - 官方 mysql entrypoint 仍被 bash `<(...)`+函数缺陷阻断（最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV），迁移暂用直接 `mysqld` 启动。
+
+- **负载期时钟偏差（新观察）**：kafka load 进行时 clocksource watchdog 报 `cs_dev_nsec=504000000` vs `wd_dev_nsec=577876797`——kvm-clock 相对 acpi_pm 慢约 13%。此前的“时钟健康”结论基于无故障时的采样；高 IO 负载下存在真实速率偏差，需复查（与 R16SRC 探针结论不矛盾：当时采样的窗口无偏差）。
+- **大镜像 load 楔死**：mysql(162MB tar)/redis/zk 均 LOAD=0；cp-kafka(416MB tar) 卡死。下一步方向：① 用 `/tmp/dockerd.log` 与任务转储定位（需可交互 guest）；② 分块加载该镜像层（逐层 `docker load`）；③ 检查是否与 overlayfs/快照解包路径相关。
+
 
 **拆分与 PR（2026-10-23 完成）**：已拆为 9 个独立 PR：**#2507** xattr EOPNOTSUPP、**#2508** run-qemu 端口、**#2509** fault 诊断、**#2510** panic stop_this_cpu、**#2511** TLB shootdown 上下文+liveness+track_caller、**#2512** idle STI;HLT（含 enqueue 守卫）、**#2513** APIC delta 告警、**#2514** 探针治理+tmict 采样修正、**#2515** virtio-blk 停顿自检。
 - **futex 持锁睡眠未开 PR**：上游 master 的 `futex_wait()` 已实现 `read_user_u32_nofault` 锁内复查 + 缺页放锁重试（与本次本地修复等价），重复提交会冲突；本地版本随 worktree 保留，rebase 时应采用上游实现。
