@@ -293,3 +293,10 @@ dockerd/containerd 全家卡死 = **LSYSCALL=202(futex) 的唤醒依赖被 R14 �
 - **诊断**：fault 现场打印 comm + rax/rdi/rsi/rdx/rsp；virtio-blk 1s 超时自检（irq/sched/run/completed）；`AddressSpace::flush_tlb_range` 补 `#[track_caller]`；QEMU 端口选择避开本机临时端口。
 - **bash `<(...)` 崩溃（未决）**：连 `echo B` 都未执行；PIE 基址 0x10000 ⇒ rip 0x65451 = `initialize_flags+0x71` 的 `mov 0x8(%rdi)`，寄存器全零。下一步：`bash -c 'echo B;/bin/true;echo A'` 区分 vfork 路径 + QEMU `-d int` 追最后一次 syscall/信号返回。
 - **PR 拆分**：见 `pr-split-2026-10-23.md`（分支/PR/合入状态）。
+
+## 八、工作流变更（2026-10-23 起）
+
+- **主 worktree 改为原子提交**：每个独立修复完成即 `git commit`（不再只 `git add`）。目的：便于后续按提交 `git cherry-pick` / `git show <sha> -- <path>` 拆分 PR，并防止外部重置丢改动。
+- 当前基线：`f0afd461`（12 个原子提交，工作区干净）；其中已合入上游的组别在提交信息里标注了 PR 号。
+- 提交粒度按子系统/修复点；探针治理与功能性修复分开提交，便于独立评审与回滚。
+- PR 拆分与覆盖审计见 `pr-split-2026-10-23.md`。
