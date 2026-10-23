@@ -186,7 +186,8 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | Redis | redis:7.2.3-alpine | `docker load` → `docker run -d` → `docker exec redis-cli ping` | ✅ `PONG`（L1=0/L2=0/R1=0/R2=0） |
 | ZooKeeper | zookeeper:3.8.3（官方，替代已下架的 bitnami 标签） | `docker load` | ✅ LOAD=0 |
 | Kafka | confluentinc/cp-kafka:7.5.0（416MB tar） | `docker load` | ❌ 挂死：中途停止写盘（盘零增长），Ctrl+C 无效 |
-| Kafka（换源复测） | bitnamilegacy/kafka:3.5.1（335MB tar） | `docker load` | ❌ **同样挂死** ⇒ 与镜像来源无关，与 tar 体积/层结构相关（mysql 162MB、redis 16MB、zk 276MB 均正常） |
+| Kafka（换源复测） | bitnamilegacy/kafka:3.5.1（335MB tar） | 连续多次 load 时 | ❌ 同样挂死 |
+| **Kafka（单独 load 复测）** | 同镜像，全新净盘 + 后台 load + 定时探针 | ✅ **`K_LOAD=0`、`Loaded image`、“Loading containers: done”**（<5 分钟） | ⇒ 楔死**不是镜像本身**，而是**连续多次大镜像 load 后的累积状态**或偶发；需按“逐个 load + 校验 + 资源检查”方式推进 |
 | ClickHouse | clickhouse-server:23.8.8.20 | 未开始 | ⏸ 排在 kafka 之后 |
 
 - 所有容器操作都在净盘 + 注入 tar（`/mysql8035.tar.gz`、`/redis72.tar.gz`）后进行；`docker load` 全程无挂死。
