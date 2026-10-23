@@ -1261,7 +1261,19 @@ impl PageFaultHandler {
         // 与远端 CPU 竞争页表/rmap 锁。
         drop(_pt_edit);
         if tlb_flush_needed {
+            // 缺页异常进入内核时 IF=0。shootdown 的等待循环不会处理中断，
+            // 若两个 CPU 同时发起 flush，会各自等待对端 ACK 而互锁（实测
+            // java 启动时 CPU0 停在 flush_tlb_multi、CPU1 停在
+            // flush_tlb_mm_range，RFL 分别为 IF=1 / IF=0）。
+            // 此处已不持有页表锁，临时开中断让本 CPU 能响应对端 IPI，
+            // 完成后恢复原 IF 状态。
+            use crate::arch::x86_64::asm::irqflags::{local_irq_restore, local_irq_save};
+            let flags = local_irq_save();
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            }
             mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+            local_irq_restore(flags);
         }
         reason
     }
