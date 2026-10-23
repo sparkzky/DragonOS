@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 use crate::arch::driver::{
     hpet::{hpet_instance, is_hpet_enabled},
@@ -25,6 +25,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
 use log::debug;
+use log::warn;
 use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -140,7 +141,75 @@ fn init_ap_apic_timer() {
         initial_count,
         LocalApicTimer::DIVISOR as u32,
     );
+    // 释放 RefCell 借用后按运行形态重标定（recalibrate 内部会再次取可变
+    // 借用；AP 上线晚于 setup_arch_post，PMTMR 已可用）。
+    drop(local_apic_timer);
+    recalibrate_apic_count_runtime();
     debug!("init_ap_apic_timer done");
+}
+
+/// R10 修复：运行形态下的 APIC 计数率重标定（PMTMR 独立参考）。
+///
+/// 启动期 `calibrate_initial_count` 以“周期模式 + LVT 屏蔽 + u32::MAX”
+/// 测量，在本平台（KVM）测得 ~250MHz；而运行形态（单次模式 + LVT
+/// 解屏蔽）实测 ~1.95GHz——相差 8 倍，导致所有单次武装提前 8 倍触发
+/// （3.97ms 的 tick 期限 0.49ms 即到期，2048Hz 中断风暴）。虚拟化平台
+/// 对屏蔽期计数器推进的语义与真实硬件不一致，且以 TSC 为窗口参考在
+/// 启动早期不可用。这里复用与 `program_deadline_delta` 完全一致的武装
+/// 形态（单次 + 解屏蔽），窗口由 PMTMR（宿主保证真实速率）计量。
+///
+/// 调用条件：本 CPU 已完成常规初始化，PMTMR 已可用；调用期间本端中断
+/// 关闭。完成后恢复周期 tick。
+pub(crate) fn recalibrate_apic_count_runtime() {
+    if PMTMR_IO_PORT.load(Ordering::SeqCst) == 0 {
+        return; // 无独立参考源，保留启动期标定
+    }
+    let cpu = smp_get_processor_id();
+    let irq_guard = unsafe {
+        <crate::arch::x86_64::interrupt::X86_64InterruptArch as crate::exception::InterruptArch>::save_and_disable_irq()
+    };
+    let mut timer = local_apic_timer_instance_mut(cpu);
+    // 与运行形态一致的武装：oneshot、LVT 解屏蔽、计数器满量程。
+    // 40ms 窗口内计数器远未耗尽（u32::MAX ≈ 2.2s），不会触发中断。
+    timer.stop_current();
+    timer.set_divisor(LocalApicTimer::DIVISOR as u32);
+    timer.setup_lvt(APIC_TIMER_IRQ_NUM.data() as u8, false, LocalApicTimerMode::Oneshot);
+    timer.set_initial_cnt(u32::MAX as u64);
+
+    let pm_start = acpi_pm_read_early() as u64;
+    let target = PMTMR_TICKS_PER_SEC * 40 / 1000; // 40ms
+    while ((acpi_pm_read_early() as u64)
+        .wrapping_sub(pm_start)
+        & ACPI_PM_MASK)
+        < target
+    {
+        spin_loop();
+    }
+    let cur = CurrentApic.read_timer_current_count() as u64;
+    timer.stop_current();
+    let elapsed = (u32::MAX as u64).saturating_sub(cur);
+    let rate_per_sec = elapsed.saturating_mul(25); // elapsed / 40ms
+    if rate_per_sec == 0 {
+        drop(timer);
+        drop(irq_guard);
+        return;
+    }
+    let new_pcount = rate_per_sec * LocalApicTimer::INTERVAL_MS / 1000;
+    crate::print_critical!(
+        "aprecal: cpu={} elapsed={} rate={} old_pcount={} new_pcount={}\n",
+        cpu.data(),
+        elapsed,
+        rate_per_sec,
+        timer.periodic_count,
+        new_pcount
+    );
+    timer.periodic_count = new_pcount;
+    timer.hres_calibrated = true;
+    let divisor = timer.divisor;
+    timer.init(LocalApicTimerMode::Periodic, new_pcount, divisor);
+    timer.start_current();
+    drop(timer);
+    drop(irq_guard);
 }
 
 pub(super) struct LocalApicTimerIntrController;
@@ -273,6 +342,19 @@ impl LocalApicTimer {
         let apic_khz = elapsed / APIC_CALIBRATE_MS;
         // apic_khz already accounts for the programmed divider.
         let initial_count = apic_khz * Self::INTERVAL_MS;
+        crate::print_critical!(
+            "apcal: cpu={} elapsed={} apic_khz={} pcount={} cpu_khz={} hpet={} pmtmr_port={:#x} HZ={} INTERVAL_MS={} DIVISOR={}\n",
+            smp_get_processor_id().data(),
+            elapsed,
+            apic_khz,
+            initial_count,
+            TSCManager::cpu_khz(),
+            is_hpet_enabled(),
+            PMTMR_IO_PORT.load(Ordering::SeqCst),
+            crate::time::clocksource::HZ,
+            Self::INTERVAL_MS,
+            Self::DIVISOR
+        );
         Some(initial_count)
     }
 
@@ -365,14 +447,189 @@ impl LocalApicTimer {
     }
 }
 
+
+// R16 取证修正：PMTMR 是 24bit（4.7ms 即回绕）计数器，直接跨窗口差分
+// 会得到无意义值（此前 tsc_hz=9.1GHz / rawrate≈0 即由此产生）。这里用
+// per-CPU 扩展计数器把回绕累加进 64bit，探针的所有差分改用该值。
+static PM_EXT: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(u64::MAX) }; PerCpu::MAX_CPU_NUM as usize];
+static PM_LAST_RAW: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(u64::MAX) }; PerCpu::MAX_CPU_NUM as usize];
+
+/// 读 PMTMR 并扩展到 64bit（本 CPU 独占槽位，探针专用）。
+fn pm_extended(cpu: usize) -> u64 {
+    let raw = (acpi_pm_read_early() as u64) & ACPI_PM_MASK;
+    let last = PM_LAST_RAW[cpu].load(Ordering::Relaxed);
+    if last == u64::MAX {
+        PM_LAST_RAW[cpu].store(raw, Ordering::Relaxed);
+        PM_EXT[cpu].store(raw, Ordering::Relaxed);
+        return raw;
+    }
+    let delta = raw.wrapping_sub(last) & ACPI_PM_MASK;
+    PM_LAST_RAW[cpu].store(raw, Ordering::Relaxed);
+    PM_EXT[cpu].fetch_add(delta, Ordering::Relaxed) + delta
+}
+
+// R5 取证：TMICT 写入点探针（唯一 ground truth）。窗口用 rdtsc（不受
+// timekeeping 冻结影响），并有按累计次数的兜底触发：now_ns() 冻结时
+// 窗口永不翻转，纯窗口逻辑会像 R4 一样零输出。
+static TP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TP_ONESHOT: AtomicU64 = AtomicU64::new(0);
+static TP_PERIODIC: AtomicU64 = AtomicU64::new(0);
+static TP_LAST_DELTA: AtomicU64 = AtomicU64::new(0);
+static TP_LAST_CNT: AtomicU64 = AtomicU64::new(0);
+static TP_LAST_NOW: AtomicU64 = AtomicU64::new(0);
+static TP_LAST_PCOUNT: AtomicU64 = AtomicU64::new(0);
+
+// R16 修正：所有采样基线必须 per-CPU。此前这些 static 由两个 CPU 交替
+// swap，导致相邻两次采样跨 CPU 混合，差分彻底失真（tsc_hz=9.1GHz、
+// rawrate≈2337 均由此产生，非系统缺陷）。
+const PROBE_CPUS: usize = PerCpu::MAX_CPU_NUM as usize;
+static TP_WINDOW_TSC: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PREV_BASE: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PREV_NOW: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PM_TSC: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PM_REF: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PREV_RAW: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+static TP_PREV_PM: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
+
+/// 探针打印编译期开关：tmict_probe 由 program_deadline_delta 在 rq/deadline
+/// 临界区内调用（IF=0），直写串口会占用数 ms —— R16 已定罪此类缺陷，默认关闭。
+/// 需要时钟取证时改为 true（采样逻辑与 per-CPU 基线修复保留）。
+const TMICT_PRINT: bool = false;
+
+fn tmict_probe(kind: usize, delta_ns: u64, cnt: u64, pcount: u64) {
+    let cpu = smp_get_processor_id().data() as usize;
+    let khz = TSCManager::cpu_khz();
+    let tsc = unsafe { x86::time::rdtsc() };
+    let total = TP_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let window_elapsed = khz > 0
+        && tsc.wrapping_sub(TP_WINDOW_TSC[cpu].load(Ordering::Relaxed)) > khz * 1_000_000;
+    if TMICT_PRINT && (window_elapsed || total % 2048 == 0) {
+        TP_WINDOW_TSC[cpu].store(tsc, Ordering::Relaxed);
+        let (base, clast, raw_read, inv, mono_mult, mono_shift) =
+            crate::time::timekeeping::debug_now_snapshot();
+        let now_full = crate::time::deadline::now_ns();
+        // 内核侧全量单调性判定（打印截断有歧义）：真回退才打印，无歧义。
+        let pb = TP_PREV_BASE[cpu].swap(base, Ordering::Relaxed);
+        let pn = TP_PREV_NOW[cpu].swap(now_full, Ordering::Relaxed);
+        if base < pb || now_full < pn {
+            crate::print_critical!(
+                "REGRESS base {}->{} now {}->{}\n",
+                pb, base, pn, now_full
+            );
+        }
+        // R10 取证：DCR 回读（运行时分频是否被改写）+ PMTMR×TSC 交叉定频
+        // （PMTMR 3.579545MHz 宿主保证，TSC 真频 = Δtsc/Δpmtmr × 3.579545e6）。
+        let pmtmr_port = PMTMR_IO_PORT.load(Ordering::SeqCst);
+        let (tsc_hz, dcr) = if pmtmr_port != 0 {
+            let pm = pm_extended(cpu);
+            let p0 = TP_PM_REF[cpu].swap(pm, Ordering::Relaxed);
+            let t0 = TP_PM_TSC[cpu].swap(tsc, Ordering::Relaxed);
+            let dt = tsc.wrapping_sub(t0);
+            let dr = pm.wrapping_sub(p0);
+            let hz = if p0 != 0 && dr > 100_000 {
+                Some((dt as u128 * 3_579_545u128 / dr as u128) as u64)
+            } else {
+                None
+            };
+            (
+                hz.map_or_else(|| "init".to_string(), |v| v.to_string()),
+                CurrentApic.read_timer_divisor_conf(),
+            )
+        } else {
+            ("nopmtmr".to_string(), CurrentApic.read_timer_divisor_conf())
+        };
+        // R12 取证：mono 换算参数 + raw（clocksource.read()）逐行速率——
+        // 与 now（timekeeper 换算）速率对拍，判"同源双速率"归属。
+        let praw = TP_PREV_RAW[cpu].swap(raw_read, Ordering::Relaxed);
+        let pm_now = if pmtmr_port != 0 { pm_extended(cpu) } else { 0 };
+        let ppm = TP_PREV_PM[cpu].swap(pm_now, Ordering::Relaxed);
+        let drate = if pmtmr_port != 0 {
+            let d_raw = raw_read.saturating_sub(praw);
+            let d_pm = pm_now.wrapping_sub(ppm);
+            if ppm != 0 && d_pm > 100_000 {
+                // raw 每真实秒的推进量（ns）：1.0e9=真实速率
+                Some((d_raw as u128 * 3_579_545 / d_pm as u128) as u64)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let pvti = crate::driver::clocksource::kvm_clock::kvm_pvti_debug();
+        crate::print_critical!(
+            "tmict cpu={} tot={} 1shot={} per={} delta={}ns cnt={:#x} pcount={:#x} now={}.{:x} inv={} base={}.{:x} cl={}.{:x} raw={}.{:x} kreg={} klast32={:#x} dcr={:#x} tsc_hz={} pvti={} mmul={} msh={} rawrate={}\n",
+            smp_get_processor_id().data(),
+            total,
+            TP_ONESHOT.load(Ordering::Relaxed),
+            TP_PERIODIC.load(Ordering::Relaxed),
+            TP_LAST_DELTA.load(Ordering::Relaxed),
+            TP_LAST_CNT.load(Ordering::Relaxed),
+            TP_LAST_PCOUNT.load(Ordering::Relaxed),
+            now_full >> 32,
+            now_full & 0xffff_ffff,
+            inv,
+            base >> 32,
+            base & 0xffff_ffff,
+            clast >> 32,
+            clast & 0xffff_ffff,
+            raw_read >> 32,
+            raw_read & 0xffff_ffff,
+            crate::driver::clocksource::kvm_clock::kvm_regressions(),
+            crate::driver::clocksource::kvm_clock::kvm_last_read32(),
+            dcr,
+            tsc_hz,
+            if pvti.is_some() { "y" } else { "n" },
+            mono_mult,
+            mono_shift,
+            match drate {
+                Some(v) => alloc::format!("{}.{:03}", v / 1_000_000, v % 1_000_000),
+                None => "init".to_string(),
+            }
+        );
+        // R16 取证探针已移除（打印位于 tick IRQ 的 IF=0 区间，属已定罪缺陷类）。
+        // 采样逻辑保留在 tmict 行内，供需要时复用。
+        if let Some((st, ts, mul, shift)) = pvti {
+            crate::print_critical!(
+                "pvti st={:#x} ts={:#x} mul={:#x} shift={} tscnow={:#x}\n",
+                st,
+                ts,
+                mul,
+                shift,
+                tsc
+            );
+        }
+    }
+    if kind == 0 {
+        TP_ONESHOT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TP_PERIODIC.fetch_add(1, Ordering::Relaxed);
+    }
+    TP_LAST_DELTA.store(delta_ns, Ordering::Relaxed);
+    TP_LAST_CNT.store(cnt, Ordering::Relaxed);
+    TP_LAST_PCOUNT.store(pcount, Ordering::Relaxed);
+    TP_LAST_NOW.store(crate::time::deadline::now_ns(), Ordering::Relaxed);
+}
 /// Caller holds the local deadline queue with local IRQs disabled. Never keep
 /// this RefCell borrow alive while dispatching a deadline callback.
 pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
-    let count = ((delta_ns as u128 * timer.periodic_count as u128)
-        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
-    .clamp(1, u32::MAX as u128) as u64;
+    let raw = (delta_ns as u128 * timer.periodic_count as u128)
+        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000);
+    if raw > u32::MAX as u128 {
+        // 请求的 delta 超出计数器范围说明 tick 期限已被毒化（正常路径
+        // delta <= 1 tick）。此前这里静默截断，会把下一次 tick 推迟数秒
+        // 到数分钟；告警以便定位上游时间读数异常。
+        warn!(
+            "apic timer: one-shot delta {}ns exceeds counter range, clamped",
+            delta_ns
+        );
+    }
+    let count = raw.clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
+    let pcount = timer.periodic_count;
+    tmict_probe(0, delta_ns, count, pcount);
     timer.init(LocalApicTimerMode::Oneshot, count, divisor);
     timer.start_current();
 }
@@ -382,6 +639,8 @@ pub(crate) fn restore_periodic() {
     if timer.mode != LocalApicTimerMode::Periodic {
         let count = timer.periodic_count;
         let divisor = timer.divisor;
+        let pcount = timer.periodic_count;
+        tmict_probe(1, 0, count, pcount);
         timer.init(LocalApicTimerMode::Periodic, count, divisor);
         timer.start_current();
     }
@@ -413,6 +672,16 @@ impl TryFrom<u8> for LocalApicTimerMode {
     }
 }
 
+impl CurrentApic {
+    /// R10 取证：回读分频配置寄存器（x2APIC MSR / xAPIC MMIO）。
+    pub(super) fn read_timer_divisor_conf(&self) -> u32 {
+        let reg = XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV as u32;
+        if self.x2apic_enabled() {
+            return unsafe { x86::msr::rdmsr(super::APIC_BASE_MSR + (reg >> 4)) as u32 };
+        }
+        unsafe { self.read_xapic_register(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV) }
+    }
+}
 impl CurrentApic {
     fn set_timer_divisor(&self, divisor: u32) {
         let div_conf = match divisor {

@@ -53,8 +53,22 @@ impl KvmClockPage {
 }
 
 static mut KVM_CLOCK_PAGES: Option<PerCpuVar<KvmClockPage>> = None;
+/// kvm-clock 已见最大读数与倒走计数（单调钳制 + 持续倒走升级）。
+static KVM_LAST_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KVM_REGRESSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static MSR_KVM_SYSTEM_TIME: AtomicU32 = AtomicU32::new(0);
 static KVM_CLOCK_READY: AtomicBool = AtomicBool::new(false);
+
+/// tmict 探针读取：倒走钳制触发次数（R9 断点判别——若楔死时恒 0，
+/// 说明读路径未经过 `KvmClock::read` 的钳制分支）。
+pub fn kvm_regressions() -> u64 {
+    KVM_REGRESSIONS.load(Ordering::Relaxed)
+}
+
+/// tmict 探针读取：已见最大读数低 32 位（会话内应恒定或递增）。
+pub fn kvm_last_read32() -> u64 {
+    KVM_LAST_READ.load(Ordering::Relaxed) & 0xffff_ffff
+}
 
 #[derive(Debug)]
 pub struct KvmClock(SpinLock<InnerKvmClock>);
@@ -93,6 +107,58 @@ impl KvmClock {
 impl Clocksource for KvmClock {
     fn read(&self) -> CycleNum {
         let now = kvm_clock_read().expect("active kvm-clock CPU has no pvclock page");
+        // KVM 在 vCPU 迁移/无 master clock 时，新 pCPU 的 pvti 值可能旧于
+        // 旧 pCPU（实测 mysql 负载下平滑倒走）。clocksource 读数按定义必
+        // 须单调：回退读数取已见最大值钳制，并累计倒走次数；持续倒走时
+        // 唤醒 clocksource watchdog 强制重选健康源（对齐 Linux 对 unstable
+        // 源的处理：先保证单调不变式，再切换源）。
+        let prev = KVM_LAST_READ.fetch_max(now, Ordering::AcqRel);
+        if now < prev {
+            if KVM_REGRESSIONS.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+                crate::time::clocksource::run_watchdog_kthread();
+            }
+            return CycleNum::new(prev);
+        }
+
+        // 冻结检测（futex 压测实证：高频线程切换下 pvti 抖动使上面的
+        // 单调钳制把读数永久锁死在旧值——rawrate=0.000，tick/调度唤醒
+        // 全停，下游表现为 futex 唤醒丢失与 daemon 楔死）。判据：读数
+        // 持续不动而独立 TSC 明显前进。命中即主动自贬 rating 为 0 并
+        // 唤醒 watchdog 重选（acpi_pm 已无条件注册），使 timekeeper 切换
+        // 到健康的硬件时基。对齐 Linux pvclock 对 unstable 源的处理。
+        static KFREEZE_TSC: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        static KFREEZE_VAL: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        static KFREEZE_HITS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let khz = crate::arch::driver::tsc::TSCManager::cpu_khz();
+        if khz > 0 {
+            let tsc = unsafe { x86::time::rdtsc() };
+            let last_tsc = KFREEZE_TSC.swap(tsc, Ordering::Relaxed);
+            let last_val = KFREEZE_VAL.load(Ordering::Relaxed);
+            if tsc.saturating_sub(last_tsc) > khz.saturating_mul(20_000) {
+                // 距上次采样已 >20ms 真实时间
+                if now == prev && now == last_val {
+                    // 本窗口内读数完全未动且与钳制值相同 → 冻结
+                    let n = KFREEZE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n >= 3 {
+                        crate::print_critical!(
+                            "kvmclock: FROZEN {}ms (val={}), demoting to rating 0\n",
+                            n * 20,
+                            now
+                        );
+                        let _ = self.update_clocksource_data(ClocksourceUpdate::SetRating(0));
+                        let _ = self.update_clocksource_data(ClocksourceUpdate::MarkUnstable);
+                        crate::time::clocksource::run_watchdog_kthread();
+                        crate::time::clocksource::clocksource_select();
+                    }
+                } else {
+                    KFREEZE_HITS.store(0, Ordering::Relaxed);
+                }
+                KFREEZE_VAL.store(now, Ordering::Relaxed);
+            }
+        }
         CycleNum::new(now)
     }
 
@@ -278,10 +344,23 @@ fn disable_system_time_msr() {
     }
 }
 
-fn kvm_clock_read() -> Option<u64> {
+pub(crate) fn kvm_clock_read() -> Option<u64> {
     let _guard = PreemptGuard::new();
     let pvti = this_cpu_pvti()?;
     Some(pvclock::pvclock_clocksource_read_nowd(pvti))
+}
+
+/// R11 取证：本 CPU pvti 原始四元组（system_time/tsc_timestamp/mul/shift）。
+pub fn kvm_pvti_debug() -> Option<(u64, u64, u32, i32)> {
+    let pvti = this_cpu_pvti()?;
+    Some(unsafe {
+        (
+            core::ptr::read_volatile(&pvti.system_time as *const u64),
+            core::ptr::read_volatile(&pvti.tsc_timestamp as *const u64),
+            core::ptr::read_volatile(&pvti.tsc_to_system_mul as *const u32),
+            core::ptr::read_volatile(&pvti.tsc_shift as *const i8) as i32,
+        )
+    })
 }
 
 fn init_msrs() -> bool {
