@@ -342,6 +342,10 @@ pub fn kernel_shutdown_prepare(state: SystemState) {
 
     set_system_state(state);
 
+    // 关机/重启前收尾可写文件系统（sync + ext4 journal 清理 RECOVER），
+    // 避免下次启动对未提交事务做 replay。
+    crate::filesystem::vfs::mount::shutdown_mounted_filesystems();
+
     device_shutdown();
 }
 
