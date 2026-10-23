@@ -196,6 +196,7 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 - **时钟速率实测（2026-10-23）**：guest `date +%s` 在宿主 148s 真实时间内前进 147s（**99.3%**）⇒ kvm-clock **平均速率准确**。
 - **watchdog 差异的细化判读**：`cs_dev_nsec` 恒为 504000000（同一个窗口值）而 `wd_dev_nsec` 在 577~784ms 间波动 ⇒ 更可能是 **kvm-clock 在这些短窗口内被冻结/钳制**（`kvm_clock::read()` 的 fetch_max 单调钳制 + 冻结检测），而非 acpi_pm 换算错误（acpi_pm mult=558/shift=1 经计算速率正确）。平均 99.3% 说明冻结是**间歇性**的（累计 ~1s/148s）。
+- **空闲复测（内核 #181，带 critical 打印）**：启动后空闲 2 分钟，`wdt unstable` 与 `long readout interval` 均为 0 条 ⇒ 偏差只在**容器/IO 负载期间**出现，非持续性问题。
 - 未决点：watchdog 偏差 (280ms) 远超 `WATCHDOG_THRESHOLD=62.5ms`，但串口未见 `cs_dev_nsec = ...`（unstable 分支）打印——可能是运行期 `info!` 被日志级别过滤，或该源已被标记 unstable 并已切到 acpi_pm（后续比对仍读 kvm）。**下一步**：① 临时打开 `TMICT_PRINT` 并在 watchdog 分支加 print_critical（放锁后）确认降级是否发生；② 提供 `/sys` 查询当前 clocksource（若无则加只读接口）以便直接判定。
 - **旧观察（已作废）**
 - **时钟偏差复现（重要）**：多次 watchdog 输出呈 `cs=504000000` vs `wd=577~784ms`（kvm-clock 相对 acpi_pm 慢 13%~36%），且与负载无关（空闲时也出现）。这说明 kvm-clock **速率本身**在 DragonOS 上不稳定，需按 R9-R13 的方法复测（PMTMR 交叉 + 是否触发自贬/切换 acpi_pm）。此前"100.1% 速率"结论只在特定窗口成立。
