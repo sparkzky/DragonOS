@@ -232,6 +232,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 新硬阻塞：`[alloc-exhausted] size=131072 align=8; parking task, kernel alive` + `[oom-kill] ... victim_tgid=234` + `[page-fault-OOM]`。即 **6G 内存在 mysql+zk+kafka 容器创建阶段被耗尽**，Rust 全局分配失败进入 `alloc_error_handler` 的 park 循环，表现为 `docker run` 永久挂起（与 2-e 同机制）。
 - 下一步：把 QEMU 内存从 6G 提高（验证 8G 是否可用；已知“非 6G 挂死”记录需复核），并按 Linux 语义把容器内存计入 cgroup/回收，避免全局堆耗尽。
 
+### 3.11 8G 内存 + TLB 延迟 flush 修复（2026-10-23 收尾）
+- **内存**：6G 下容器创建期全局堆耗尽（`alloc-exhausted` park + `oom-kill`）；8G 启动正常（`MemTotal=8359040 kB`，可用 8125MB），4 镜像加载 + 4 容器创建全部成功，期间 **0 次 alloc-exhausted / 0 次 EIO**。
+- **TLB 死锁**：全栈运行中 java 启动瞬间整机停摆（CPU 0、无时钟中断），最后日志为 `flush_tlb_mm_range at src/mm/fault.rs:1223`（关中断 shootdown）。已在 `do_wp_page` 改为：守卫内只置 `tlb_flush_needed`，`drop(_pt_edit)` 后再 shootdown。
+- **验证**：修复后单独跑 kafka —— `L_KFK=0`、`RUN_KFK=0`、`docker ps` RC=0、**`kafka-topics.sh --bootstrap-list` RC=0**，shell 正常返回（此前同场景必挂死）。
+- 注意：缺页上下文本身 IF=0，shootdown 仍会打印 `initiated with interrupts disabled` 提示（信息性），但已不再与页表/rmap 锁形成死锁环。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
