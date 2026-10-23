@@ -260,6 +260,25 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 其余调用点核查：`mremap.rs`（进程上下文、持 mm 锁但不关中断）、`oom_reap.rs`（回收线程）、`uprobe/*`（进程上下文）、`mmu_gather::flush_mmu_tlbonly`（gather 结束后统一 flush）均不在关中断区，无需改造；`PageFlush::flush()` 只是本地 `invlpg`，不产生 IPI。
 - 复验（#195/8G，干净盘）：kafka `docker load`/`docker run`/`docker ps`/`kafka-topics --list` 全 RC=0。
 
+### 3.14 容器/用户态回归复验与 Go 服务镜像（2026-10-23 晚）
+内核 #195 / 8G / 干净盘实测：
+
+| 项目 | 旧现象 | 现结果 |
+|---|---|---|
+| bash `<(函数)` | 父 bash SIGSEGV(139) | `bash -c 'f(){ :; }; cat <(f)'` → RC=0；带输出变体 `hi`/`x` 均 A=0/B=0 |
+| 管道阻塞 | `yes | head -1` 挂住 | `y` + `P=0`；`echo hello | cat` → `hello` + `Q=0` |
+| 2-e 容器删除后重跑 | `docker run` 挂起 | `docker rm -f kfk` → RM=0；`docker run -d --name kfk2 …` → RUN2=0（无第三方依赖直接退出属预期） |
+
+结论：三者都是此前内存耗尽 / 交叉 TLB 死锁的**下游症状**，修复后自然消失，无独立缺陷需修。
+
+### 3.15 Go 服务镜像构建（host 侧完成）
+- `make -C manager/backend build-bin-static` 产出静态二进制：`ocmanager`(59M)、`footstone`(56M)、`msg-etl`(43M)、`sysdiagnose`(41M)。
+- 镜像（`Dockerfile.backend` + `--build-arg RUNTIME_IMAGE=alpine:3.19`）：
+  - `oc-footstone:dev` 131MB、`oc-msg-etl:dev` 104MB、`oc-sysdiagnose:dev` 99.2MB；
+  - `ocmanager` 无 `services/ocmanager/configs` 模板，未构建（该服务不作为容器模板发布）。
+- 导出 `/home/sparkzky/ocm-tars/ocservices.tar.gz`（139MB，三镜像合一）。
+- 部署脚本 `r16_ocm_up.sh`：`--network host` 起 mdb/rds/ch/kfk + footstone（env 走 `config/env.example` 语义），先探活 CH/Redis/Kafka，再 `docker logs foot`。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
