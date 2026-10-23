@@ -448,12 +448,8 @@ impl<'a> PageFaultMessage<'a> {
         let index = table.index_of(address).unwrap();
         entry.set_flags(entry.flags().set_write(true).set_dirty(true));
         table.set_entry(index, entry);
-        mm.flush_tlb_range(
-            address,
-            VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
-            MMArch::PAGE_SHIFT as u8,
-            false,
-        );
+        drop(_pt_edit);
+        flush_tlb_after_unlock(&mm, address);
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
@@ -1261,19 +1257,7 @@ impl PageFaultHandler {
         // 与远端 CPU 竞争页表/rmap 锁。
         drop(_pt_edit);
         if tlb_flush_needed {
-            // 缺页异常进入内核时 IF=0。shootdown 的等待循环不会处理中断，
-            // 若两个 CPU 同时发起 flush，会各自等待对端 ACK 而互锁（实测
-            // java 启动时 CPU0 停在 flush_tlb_multi、CPU1 停在
-            // flush_tlb_mm_range，RFL 分别为 IF=1 / IF=0）。
-            // 此处已不持有页表锁，临时开中断让本 CPU 能响应对端 IPI，
-            // 完成后恢复原 IF 状态。
-            use crate::arch::x86_64::asm::irqflags::{local_irq_restore, local_irq_save};
-            let flags = local_irq_save();
-            unsafe {
-                core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
-            }
-            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
-            local_irq_restore(flags);
+            flush_tlb_after_unlock(&mm, address);
         }
         reason
     }
@@ -1785,3 +1769,27 @@ impl PageFaultHandler {
         VmFaultReason::VM_FAULT_COMPLETED
     }
 }
+
+/// 缺页上下文（IF=0）下执行 mm-aware shootdown。
+///
+/// `flush_tlb_multi` 的等待循环不处理中断：若两个 CPU 同时发起 flush，
+/// 双方都在等对方 ACK，而对方因为 IF=0 永远收不到 IPI，形成整机停摆
+/// （实测 java 启动时 CPU0 停在 flush_tlb_multi、CPU1 停在
+/// flush_tlb_mm_range）。调用本函数前必须已释放 `page_table_edit()` 守卫，
+/// 这样临时开中断期间不会有本 CPU 持锁自锁的风险。
+fn flush_tlb_after_unlock(mm: &Arc<AddressSpace>, address: VirtAddr) {
+    use crate::arch::x86_64::asm::irqflags::{local_irq_restore, local_irq_save};
+    let flags = local_irq_save();
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+    mm.flush_tlb_range(
+        address,
+        VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
+        MMArch::PAGE_SHIFT as u8,
+        false,
+    );
+    local_irq_restore(flags);
+}
+
+
