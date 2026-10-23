@@ -255,6 +255,11 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 2. `do_wp_page` 的 TLB shootdown 推迟到 `page_table_edit` 放开后；
 3. 该延迟 shootdown 期间临时开中断，避免两 CPU 互相等待 ACK 的交叉死锁。
 
+### 3.13 阻断1收口：缺页路径 shootdown 全部延后（2026-10-23）
+- `fault.rs` 内两处 mm-aware 更新（`do_wp_page` 四个分支、`upgrade_external_pfn`）统一改为：守卫内只记录 `tlb_flush_needed` → `drop(_pt_edit)` → `flush_tlb_after_unlock()`（等待 ACK 期间临时开中断，结束恢复 IF）。
+- 其余调用点核查：`mremap.rs`（进程上下文、持 mm 锁但不关中断）、`oom_reap.rs`（回收线程）、`uprobe/*`（进程上下文）、`mmu_gather::flush_mmu_tlbonly`（gather 结束后统一 flush）均不在关中断区，无需改造；`PageFlush::flush()` 只是本地 `invlpg`，不产生 IPI。
+- 复验（#195/8G，干净盘）：kafka `docker load`/`docker run`/`docker ps`/`kafka-topics --list` 全 RC=0。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
