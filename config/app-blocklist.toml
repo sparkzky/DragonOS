@@ -67,5 +67,5 @@ blocked_apps = [
     { name = "test_ebpf_new", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
     { name = "test_ebpf_tp", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
     { name = "runcell", reason = "依赖项依赖github，可能网络问题导致编不过" },
-
+    { name = "virtiofs_bench", reason = "ocmanager移植调研: nix devshell ld缺静态libc，基准测试与调研无关，临时屏蔽" },
 ]

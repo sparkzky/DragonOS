@@ -4,7 +4,7 @@ arch = "x86_64"
 
 [rootfs]
 fs_type = "ext4"
-size = "4G"
+size = "16G"
 partition = "mbr"
 
 [base]

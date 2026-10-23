@@ -4,7 +4,7 @@ FROM ${BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 ARG DOCKER_VERSION=5:29.1.3-1~ubuntu.24.04~noble
 ARG CONTAINERD_VERSION=2.2.0-2~ubuntu.24.04~noble
-
+ARG DOCKER_COMPOSE_VERSION=2.40.3-1~ubuntu.24.04~noble
 # Use signed package repositories and the distribution's maintained CA bundle.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -20,7 +20,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "docker-ce=${DOCKER_VERSION}" "docker-ce-cli=${DOCKER_VERSION}" \
         "containerd.io=${CONTAINERD_VERSION}" \
-    && update-alternatives --set iptables /usr/sbin/iptables-nft \
+        "docker-compose-plugin=${DOCKER_COMPOSE_VERSION}" \
+    && docker compose version \
     && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft \
     && test -s /etc/ssl/certs/ca-certificates.crt \
     && docker --version && dockerd --version && containerd --version && runc --version \
