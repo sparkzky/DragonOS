@@ -40,7 +40,7 @@ pub unsafe fn lookup_kallsyms(addr: u64, level: i32) -> bool {
         if sym_name.starts_with("kernel_main") {
             is_kernel_main = true;
         }
-        println!(
+        println_critical!(
             "[{}] function:{}() \t(+) {:04} address:{:#018x}",
             level,
             sym_name,
@@ -48,7 +48,7 @@ pub unsafe fn lookup_kallsyms(addr: u64, level: i32) -> bool {
             addr
         );
     } else {
-        println!(
+        println_critical!(
             "[{}] function:unknown \t(+) {:04} address:{:#018x}",
             level,
             addr - kallsyms_address_list[sym_num - 1],

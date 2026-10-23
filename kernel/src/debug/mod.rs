@@ -15,6 +15,7 @@ pub mod rcu;
 pub mod rng;
 pub mod sysfs;
 pub mod timekeeping;
+pub mod task_dump;
 pub mod traceback;
 pub mod tracing;
 pub mod vfs;
