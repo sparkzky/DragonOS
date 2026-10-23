@@ -1,0 +1,241 @@
+# DragonOS 运行 OCManager：问题现状与解决方案总览
+
+> 更新：2026-10-21 | 工作区：`~/DragonOS-ocmanager`（60+ 文件已 git add 未提交）
+> 流水账明细见 `fix-inventory-2026-10-18.md` 与 `assessment-2026-10-16.md`；本文是**重构后的可读总览**。
+
+---
+
+## 0. 一句话现状
+
+**时钟子系统已修复并验证**；当前唯一卡点是一个**调度器缺陷：被唤醒的任务躺在运行队列里却长期不被调度执行**，它同时导致 mysql 容器楔死和 dockerd 全家卡死。嫌疑已收敛到 EEVDF 调度器对"正在运行任务"的 deadline 刷新语义，距最终修复预计一步之遥。
+
+---
+
+## 1. 背景与目标
+
+- **目标**：在 DragonOS 上跑通 OCManager 运维平台（16 容器 compose 栈：MySQL/Redis/ZooKeeper/Kafka/ClickHouse + 11 Go 服务 + nginx）。
+- **方法**：修内核缺陷 → QEMU 验证 → mysql 容器 `ready for connections` → compose 全栈。
+- **环境**：QEMU(KVM, q35, 6G, 2vCPU)，共享服务器（注意其他会话会 pkill 清扫 QEMU）。
+
+---
+
+## 2. 已修复并实测验证的问题
+
+### 2.1 第一阶段：容器基础能力（全部通过）
+
+| # | 问题 | 修复 | 验证 |
+|---|------|------|------|
+| A | overlayfs 合并目录 getdents 枚举损坏，entrypoint 全部跑不起来 | `OvlInode::find` 补 `.`/`..` 处理 | docker 容器正常执行 |
+| B | netns 内 iptables-nft `xt_udp` 失败 → embedded DNS 死 | 新增 `NftXtUdp` 表达式 | compose 服务名解析通过 |
+| G | open 未知 flag 位被拒 | `from_bits_truncate` | docker create/start 通过 |
+| — | `times()` 系统调用缺失 | 实现 | mysqld 启动期通过 |
+| — | `do_kern_addr_fault` 把内核态缺页当用户态 oops | 区分访问上下文 | 无 oops |
+
+### 2.2 第二阶段：稳定性与内存（全部通过）
+
+| # | 问题 | 修复 | 验证 |
+|---|------|------|------|
+| H | 一次时钟倒置读数毒化 tick 绝对期限 → 定时器风暴 | `clocksource_delta` 倒置按 0 处理 | 风暴自愈 |
+| H' | CFS 带宽欠费域武装死循环（1250Hz） | `set_next_task` 去武装 + 预算域门控 | 注入率回落 |
+| F5 | ext4 journal 重放 4KB 栈溢出 | 重放链堆内存化 | 不再溢栈 |
+| F6 | KMSG 锁内分配死锁（printk 级联静默死） | 锁内禁分配 | 静默死亡形态消灭 |
+| F7 | write_block 校验缺失 + PCB 守卫刷屏 | 范围校验+条件化 | 启动循环修复 |
+| C | OOM 全链 panic（分配器/oom/printk 递归） | 停车不 panic + 零分配 SIGKILL + emergency_print | 2G docker load 存活 |
+
+### 2.3 第三阶段：时钟子系统（mysql 负载 100.1% 真实速率验收）
+
+| # | 问题 | 修复 | 验证 |
+|---|------|------|------|
+| R9 | watchdog 长间隔跳过比对（慢钟漏检） | 长间隔继续比对 | 捕获 kvm-clock 慢 5 倍 |
+| R10-1 | acpi_pm 只在前者失败时注册 → 无参考源 | 无条件注册 | PMTMR 注册 ✓ |
+| R10-2 | watchdog 参考源选了慢钟（反向归责） | 独立硬件源优先 | ref=acpi_pm ✓ |
+| R10-3 | APIC 标定形态不一致 → 中断风暴(2048Hz) | PMTMR 参考、运行形态重标定 | fire 率归一 245/s ✓ |
+| R12 | 时钟链综合 | （上述合力） | **mysql 负载 886s@885s wall=100.1%** ✓ |
+
+### 2.4 第四阶段：取证基建修复（为定位当前主诉而建，本身也是缺陷修复）
+
+| # | 问题 | 修复 | 验证 |
+|---|------|------|------|
+| R12-1 | AP 重标定 RefCell 双重借用 panic | 先 drop 再调用 | panic 消灭 |
+| R13-3 | 任务转储无法定位卡死 syscall（Go 信号帧污染） | PCB 记录 `last_syscall` | 定罪 docker=futex(202) |
+| R13-4 | B 态检测误报/漏报 | USER BLOCK STORM 阈值检测 | 干净复测通过 |
+| R13-2 | idle CPU 入队不 kick（对齐 Linux ttwu） | `send_resched_ipi` | 语义修复（未解主诉） |
+| R13-1 | kvm-clock 高频切换下读数冻结 | 冻结检测→自贬+重选 acpi_pm | 编入待实战触发 |
+
+---
+
+## 3. 当前唯一主诉：唤醒任务调度饥饿
+
+### 3.1 现象（三层同构）
+
+1. **futex 压测**（自编 C 双线程 WAIT/WAKE 程序，可复现）：worker 被 futex_wake 成功唤醒入队后，**~1 秒不被调度执行**；发起唤醒的 main 一旦 sleep 让出 CPU，worker **立即**运行。
+2. **mysql 容器**：启动后 2-14 分钟整体楔死（容器消失、CLI 挂起）。
+3. **dockerd**：全家 43 线程停在 futex 等待（LSYSCALL=202），从启动时刻起 0% CPU。
+
+**三者同根**：Go runtime / pthread 依赖 futex 唤醒，唤醒入队后不被调度 → 一切等待者永久饥饿。
+
+### 3.2 已排除（六天六层证伪，勿重走）
+
+| 层 | 证伪手段 | 结论 |
+|----|---------|------|
+| futex 子系统 | 压测 probe：`FUTEX_WAKE` 返回 1（waiter 出队+wake 执行成功） | 无罪 |
+| `ProcessManager::wakeup` 吞错 | WKFAIL 探针零输出（无 Err） | 无罪 |
+| idle CPU 缺 kick | 补 kick 后 STUCK 复现 | 非根因（修复保留） |
+| 唤醒 vruntime 放置 | place 探针：vr==avg==min 一致 | 无罪 |
+| 挂错 cfs_rq | rq_cpu==se_rq_cpu | 无罪 |
+| 目标 CPU 零 pick / 用户态返回不调度 | pickstat：两 CPU 各 300 pick/s 活跃；handle.rs 确认有检查+SM_PREEMPT | 无罪 |
+
+（另注：#134/136 曾出现"vr≠avg"反常，后查明是加探针时误删赋值语句的自伤，已修复作废。）
+
+### 3.3 真凶定罪（R15，2026-10-22 终局：调度器唤醒路径两个缺陷）
+
+旧嫌疑（mark_sleep 失败、timer 时序、ERESTARTSYS 循环、跨 CPU 陈旧读）全部无罪：R15EXIT 探针显示 `wait_res=Ok`（res=1）、`inq=0`（被正常 wake 出队）、`sig=0 pst=0 park=0`（无幻影信号）。
+
+真实图像（R15WKE/R15ENQ/R15BADHALT 铁证）：`R15WAKE cnt=1` 正确出队+唤醒 worker，worker 入队到 **idle 的 cpu1**（was_idle=1, nr=1 唯一实体），却 ~1 秒不跑；**R15BADHALT：idle 任务在自身 cfs_rq nr_running>0 时反复 halt**（修复前启动期数千次/秒洪泛）。
+
+**缺陷 1：`enqueue_task_on_cpu` 缺失唤醒抢占评估**（`sched/mod.rs`）。activate_task 后从不调用 `check_preempt_current`（Linux ttwu_do_activate→wakeup_preempt 语义）：本地唤醒到 idle rq（target==self 不发 IPI）时 NEED_SCHEDULE 从不置位；远端非 idle 目标完全不做抢占评估。修复：激活后 `if !Arc::ptr_eq(&rq.current(), pcb) { rq.check_preempt_current(pcb, wake_flags); }`（idle current 走 resched_current 置标志+远端 IPI）。
+
+**缺陷 2：idle 循环 halt 丢失唤醒窗口**（`arch/x86_64/process/idle.rs`）。NEED_SCHEDULE 检查在开中断下执行后直接 `hlt`，落在"检查之后、halt 之前"窗口内的 IPI 被无视。修复（对齐 Linux x86 default_idle/safe_halt）：关中断复查 NEED_SCHEDULE（+nr_running 无锁窗口兜底）→ `enable_and_hlt()`（STI;HLT 原子开中断+停机，IPI 要么先于复查要么在 STI;HLT 之后，无丢失窗口）。
+
+### 3.4 验证结果（R15Hunter 实测 + Main 复核，2026-10-22）
+
+- BADHALT 洪泛消除：数千/秒 → 启动期零星、负载期 0
+- STUCK 恢复从"probe 1+ 多秒延迟"→ 即刻恢复；~10 分钟数百万次握手零内核 STUCK（alarm(600) 终止）
+- 残留 "STUCK at iter 1"（Main 复跑复现 1 次，RECOVERED at probe 1）为测试程序自身启动竞态：main 首次 FUTEX_WAKE 先于 worker 入队，Linux 同行为——非内核缺陷
+- 内核 #160（2026-10-22 02:11 构建）；探针族 R15ENQ/R15SND/RCV/WKE/WAKE/BADHALT/TICK/ENT/EXIT 保留在 worktree
+
+### 3.5 mysql 终验阻断：新缺陷 R16——cpu0 关中断死锁 + 跨核等待链（2026-10-22 Main 定罪）
+
+R15 验收后 mysql 终验（净盘 + docker load + run）被阻断，三轮复现 + QEMU monitor 硬件级取证定罪：
+
+**定罪证据链**（R16SRC 三源同刻探针 + QEMU monitor `info lapic`/`info registers`）：
+1. 时钟子系统**全程健康**：tsc 3.893GHz（恒定）、kvm-clock kraw 与 timekeeper now 严格同步（4.096s/1024tick 精确）、APIC tick 正常——此前"pvti 冻结/tsc_hz=9.1GHz/rawrate=2337"全部是 **tmict 探针 PMTMR 24bit 回绕 bug**（4.7ms 掩码回绕，秒级窗口差分无意义），探针谎言非系统缺陷
+2. **cpu0 不再取中断**：进入 `flush_tlb_multi` 的 IF=0 自旋后，monitor 显示其 `IRR` 含 vector 151（timer）/201（FlushTLB）pending 不被消费、`current_count` 仍在倒计数——APIC 正常产生中断，CPU 因关中断而不取。（注：tmict/R16SRC 打印为全局节流，某核打印消失本身不足以推断该核 tick 停，需以 IRR/IF 为准。)
+3. **cpu0 死锁现场（已坐实）**：`RIP=0xffff800000581482` 恒定（两次采样不变），位于 `mm/tlb.rs::flush_tlb_multi` 的 `while !csd.done.load(Acquire) { spin_loop() }` 自旋环，**IF=0 关中断**、CPL=0、非 HLT。调用链（栈帧逐一定位）：`syscall_64 → syscall_handler → kernel_catch_unwind → flush_tlb_kernel_range+0x1d5 → flush_tlb_multi`——用户态 syscall 触发的内核地址空间（vmalloc/vfree）shootdown，**不是中断/RCU 上下文，也不是 torture**
+4. **shootdown 目标核已死**：CSD 条目（0xffff8001c0007020）done=0；cpu0 ICR=0x40c9（dest=1, vector 201）；cpu1 `IRR`=151,201——**FlushTLB IPI 已投递而 cpu1 永不 ack**。cpu1 此时已在 panic parking，故 cpu0 永久关中断等待
+5. 下游全解：MON sleep 死 / docker load 卡死 / tty 无回显 = cpu0 关中断永久自旋的次生
+
+**cpu1 panic 全文（已抓到）**：`CpuRunQueue::self_lock spinout on cpu ProcessorId(1), caller src/sched/mod.rs:1288`——`__schedule_inner` 取本 rq 锁自旋 1e6 次触发保护 panic；调用者链为 `x86_64_do_irq`（tick 中断中调度）。cpu1 随后 parking（`pause;jmp`）——**只有一个核 panic 停车、系统半死**，这是后续 shootdown 永久等待的直接前提。时间线：他核长时间持有 rq1 锁（cpu0 当时在 `enqueue_task_on_cpu(target=1)`）→ cpu1 tick 抢锁 spinout → panic 停车 → cpu0 之后做 TLB shootdown 等死核 → 全系统用户态停摆。
+
+**两个真实缺陷（与 Linux 对齐方向）**：
+a. **探针放入 IRQ 关闭 + 持 rq 锁的临界区**：R15 的 `R15ENQ`/`R15ENQIPI` 与 `send_resched_ipi` 探针在 rq 锁内用 `print_critical!` 直写串口（单行数 ms，串口忙时更久），直接构成 1e6 自旋超时的来源。此类探针必须全部清除——任何 console 输出都不得出现在锁内/关中断区。
+b. **`mm/tlb.rs` 在调用者原子里临时 `interrupt_enable()` 再关中断**：这是为让 IPI 送达的权宜手段，但允许 IRQ 重入 `__schedule_inner` 抢**被中断帧本身持有的 rq 锁**（cpu1 的 self-deadlock panic 正是此形态）。必须删除该 hack，改为在无锁/中断安全上下文发起 shootdown。
+c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootdown 都会永久挂住发起核（本轮停机形态）。panic 语义应对齐 Linux：panic 后停止其它 CPU 或整机复位，不能只 park 当前核。
+
+**已作废的判断（留档防重走）**：cpu0 卡点曾被误归因为 `rcu::torture::torture_callback`（把 RIP `0x581482` 误映射为 `0x481482`；且 torture 仅 debugfs 按需触发，本轮无触发证据）。RCU 内联 drain 线索同样不再相关。
+
+**修复计划**：① 清除 sched 中的 `print_critical!` 探针（尤其 rq 锁内/关中断区的 R15ENQ/R15ENQIPI）及其连带的长临界区；② 重做 `mm/tlb.rs` shootdown 发起路径：不在持有 rq 锁/关中断的调用者里临时开中断，改为对齐 Linux `native_flush_tlb_multi` 的前提约束（调用者不得持会与 IRQ 抢的锁），或改由专门 IPI 处理侧完成；③ 强化 panic 语义：panic 后停机其它 CPU / 整机复位，避免半死系统导致的永久 shootdown 等待；④ tmict 探针已修（per-CPU 采样基线 + PMTMR 24bit 扩展，内核 #162 编译通过），且 tmict/pvti/dlprobe 的打印均已改为**编译期开关默认关闭**（`TMICT_PRINT`/`DL_PROBE_PRINT = false`）——同一类"console in irq-off"缺陷不得留窗口。
+
+**验证状态（内核 #171，2026-10-22 19:3x）**：
+- ✅ **R16 死锁已消除**：净盘 + `docker load` 全程（>13 分钟）零 panic、零 rq spinout、零 `sched: long rq section`；`Loaded image` / `LOAD_RC=0` 达成。旧内核约 5 分钟必挂，修复前从未跑完 load。
+- ⚠️ **阻断 1（已 pinpoint 到包装层）**：`tlb: N shootdown(s) initiated with interrupts disabled ... via flush_tlb_mm_range at src/mm/ucontext/address_space.rs:965`（73/5/10 次，cpu0/1）。track_caller 目前停在薄包装层（已给 `AddressSpace::flush_tlb_range` 补 `#[track_caller]`，下次编译可定位真实调用点）。代码审计：`page_table_edit()` 的 IF 检查是 `debug_assert!`（release 不生效），不能排除"内核态 IF=0 缺页"；`mm/fault.rs` COW 分支在持该锁期间同步 shootdown。修法：gather 只记录、放锁后在可中断上下文统一 flush；内核态原子区 fault 延迟 flush。
+- ⚠️ **阻断 2（已定位到具体进程）**：entrypoint 日志 `175 Segmentation fault | docker_process_sql --dont-use-mysql-root-password --database=mysql`——**mysql 客户端在初始化导入时区数据时段错误**；内核侧对应 `pid N No mapped vma ... rip:0x65451, address:0x8`。`mysqld --version`、`/bin/echo`、基础容器执行均正常（非 runc/镜像问题）。首个容器崩溃后，后续 `docker run` 会挂起（runtime 被拖死）。`getxattr/listxattr` 已改为 `EOPNOTSUPP`（Linux 语义），告警消失。
+- ✅ **阻断 2 已定性（bash process substitution + /proc/self/fd pipe 重打开缺失）**：
+  - 崩溃进程是 **bash**（非 mysql）：`pid 696/931 (bash) No mapped vma, rip:0x65451, address:0x8, rax..rdx=0`。
+  - 最小复现：`docker run --rm --entrypoint bash mysql:8.0.35 -c 'cat <(echo HI)'` 稳定复现同签名崩溃；普通管道 `echo hi|cat`、`/proc/self/fd/3`（普通文件）均正常。
+  - mysql entrypoint 第 261 行用了 `--defaults-extra-file=<( _mysql_passfile ... )`（process substitution），因此初始化必崩。
+  - 机理（二次修正，已到指令级）：`/dev/fd -> /proc/self/fd` 存在，简单 pipe 重打开正常（`echo hi|{ cat;echo A=$?;cat /dev/fd/0;echo B=$?; }` → `hi/A=0/B=0`）。崩溃发生在 **bash 解析/展开 `<(...)` 阶段**（连 `echo B` 都未执行）。
+  - 指令级定位：PIE 二进制在 DragonOS 上统一加载于基址 `0x10000`（由 `/proc/self/maps` 证实），故崩溃 `rip=0x65451` ⇒ 文件偏移 `0x55451`，落在 **`initialize_flags`+0x71** 的 `mov 0x8(%rdi),%esi`（此时 `rdi=0` ⇒ 读地址 0x8）。寄存器 `rax/rdi/rsi/rdx` 全零，说明进入该点的调用/返回状态已被破坏（非正常参数路径）。
+  - 下一步（两条并行）：① `bash -c 'echo B;/bin/true;echo A'` 与 `bash -c 'echo B;/bin/echo X;echo A'`——若同样崩溃，则问题在 **bash fork/vfork 执行外部命令** 的 TrapFrame 复制路径，而非 process substitution 专有；② 用 QEMU `-d int` 追崩溃进程最后一次 `syscall/信号返回`，区分 fork TrapFrame 与 `rt_sigreturn` 恢复帧损坏。注意容器 stdout 经 docker 捕获偶有丢失，判定时优先用「命令后 `echo 标记`」或写入文件再读。
+  - 修复方向：为 `/proc/<pid>/fd/N` 实现 Linux `proc_fd_link` 语义——`special_node()` 返回目标文件，`open` 时**复制文件描述**（同一 pipe 端），使 process substitution 可用。
+- ✅ **阻断 1 pinpoint 已取得**：`tlb: ... via flush_tlb_mm_range at src/mm/fault.rs:1206` 与 `:1223`（COW/写时复制缺页路径同步 shootdown）。修法：gather 后延迟 flush，或内核态原子区 fault 不发起同步 shootdown。
+- ✅ **阻断 4 本轮未复现**：futex 修复后 `docker load` 完整跑完（`Loaded image`、`LOAD_RC=0`），自制 `vblk stall` 自检零命中。块 IO 停顿很可能是 futex 持锁睡眠的下游。
+- 🎯 **mysql 终验达成（内核 #180，2026-10-22 21:06）**：
+  - `docker load` 完整成功（`Loaded image: mysql:8.0.35`、`LOAD_RC=0`），无 IO 停顿（自制 `vblk stall` 零命中）。
+  - MySQL 8.0.35 在容器内初始化并启动成功：`ready for connections. Version: '8.0.35' socket '/var/run/mysqld/mysqld.sock' port: 3306`；InnoDB 自动回退 "Linux Native AIO not supported"（`SYS_IO_SETUP` ENOSYS 不致命）。
+  - 真实查询验证：`docker exec pmv mysql -uroot -e 'select version();'` → `8.0.35`，RC=0；`STATUS` 显示 Uptime 正常、socket 在线。
+  - 说明：为绕开下述 bash 缺陷，本轮以 `--entrypoint bash -c 'mysqld --initialize-insecure ...; exec mysqld'` 启动；官方 entrypoint 路径仍受 process substitution 缺陷阻断。
+- ⚠️ **剩余缺陷（官方 entrypoint 阻断）**：`bash -c 'cat <(echo HI)'` 稳定崩溃（`rip:0x65451, addr:0x8, rax..rdx=0`），而普通管道/普通文件 fd 重打开正常；对照 `echo hi|{ cat /proc/self/fd/0; }` 读不到数据。⇒ `/proc/<pid>/fd/N` 对 **pipe** 缺少"复制同一文件描述"的魔法链接语义（`LockedPipeInode` 已有 `acquire_file()` 复用 runtime，但 FileReference 在 walker 中被降级为 `path_inode()`）。修复后官方 entrypoint（第 261 行 `--defaults-extra-file=<(...)`）即可工作。
+- 结论：**mysql 已在 DragonOS 上跑通并接受查询**；剩余为 bash/procfs 兼容性缺陷与 tlb shootdown 上下文修复。
+- ✅ **阻断 3（已修复，内核 19:58）**：`docker`/`dockerd`/`containerd`/`busybox` 全部 `Blocked(true) LSYSCALL=202`（futex）、ctxsw 零增长。**真因**：`futex_wait` 持全局 `futex_map` 锁执行可睡眠的 `copy_from_user`——用户页缺页时持锁睡眠 ⇒ 全体 futex 系统调用阻塞（并非 wakeup 握手竞态）。**修复**（对齐 Linux `futex_wait_setup`）：锁外可睡眠读并比较 val；持锁后仅用 `PageFaultDisabledGuard` 复查，缺页则放锁、锁外完成映射后重试；入队/激活定时器仍在锁内。
+- ⚠️ **阻断 4（当前硬阻断）**：`docker load` 仍在 ~4 分钟处停顿，TASK DUMP 显示 `virtio_blk_io_1 state=Blocked(false)` + `ext4_journal`/`vfs_writeback`/`pagecache-wb-*` 全停；dockerd/containerd 的 futex 等待是其下游。即**块 IO 完成链停止**（used ring 不被回收）。最高概率：virtio-blk 的 EVENT_IDX/avail-event 处理导致设备不再中断；其次 tasklet 未执行或 token 不匹配。futex 持锁睡眠修复保留（真实缺陷），但不是本次停顿的充分因。
+- 环境备注：为释放磁盘（曾 100% 满），已删除两份旧样本盘 `clock-chaos-sample-1242.img`/`dirty-journal-sample-1210.img`（证据已固化于本文档）；disk-image 为稀疏盘。
+
+**样本**：历史样本盘已删除以释放磁盘（证据均固化于本文档）。
+
+### 3.6 本会话新增修复清单（未提交、待拆分 PR，2026-10-23）
+
+以下为 R16 阶段产出、尚未进入任何 PR 的修复（当前全部在 `~/DragonOS-ocmanager` 的 staged 快照中）：
+
+| # | 修复 | 关键文件 | 验收证据 |
+|---|------|---------|---------|
+| 1 | **futex_wait 持全局锁可睡眠拷贝** → 对齐 Linux `futex_wait_setup`（锁外可睡眠读 + 锁内 `PageFaultDisabledGuard` 复查 + 缺页放锁重试） | `libs/futex/futex.rs` | 修复前 load ~4 分钟全栈 futex 挂死；修复后 `Loaded image`/`LOAD_RC=0` |
+| 2 | **tmpfs/xattr 默认返回码** `ENOSYS`→`EOPNOTSUPP_OR_ENOTSUP`（Linux 语义）、warn→debug | `filesystem/vfs/mod.rs` | 串口 xattr 告警消失 |
+| 3 | **TLB shootdown 上下文与 liveness**：删除"调用者关中断时临时开中断"hack；`check_shootdown_context` 一次性告警（延后打印）；CSD 等待按目标核 Online 状态脱身；停滞计数 | `mm/tlb.rs` | load 全程无永久等待 |
+| 4 | **panic 语义**：idle 上下文 panic 走 `stop_this_cpu()`（Online→Dying→Dead + 关 LAPIC + 纯 hlt，去掉 halt 循环内打印） | `debug/panic/mod.rs`、`arch/x86_64/process/mod.rs` | 半死核不再拖死 shootdown |
+| 5 | **探针治理**：删除锁内/关中断区 console 探针（sched/fair/ipi/futex/idle/manager-sched/timekeeping/clocksource/task_dump）；tmict/pvti/dlprobe 打印改编译期开关默认关；tmict 采样基线改 per-CPU + PMTMR 24bit 扩展；新增放锁后 rq 长临界区哨兵 | `sched/mod.rs`、`sched/fair.rs`、`exception/ipi.rs`、`arch/x86_64/process/idle.rs`、`process/manager/sched.rs`、`time/timekeeping.rs`、`time/clocksource.rs`、`time/deadline.rs`、`arch/x86_64/driver/apic/apic_timer.rs`、`debug/task_dump.rs` | BADHALT 洪泛消除；rq spinout 消失 |
+| 6 | **fault 现场诊断增强**：`No mapped vma` 打印进程名 + rax/rdi/rsi/rdx/rsp | `arch/x86_64/mm/fault.rs` | 定位 bash 崩溃至 `initialize_flags+0x71` |
+| 7 | **块 IO 停滞自检**：1s 超时 + irq/sched/run/completed 计数（仅进程上下文打印） | `driver/block/virtio_blk.rs` | 本轮零命中，佐证 futex 修复后 IO 正常 |
+| 8 | **track_caller 链路**：`AddressSpace::flush_tlb_range` 补 `#[track_caller]`，用于 pinpoint shootdown 真实调用点 | `mm/ucontext/address_space.rs` | 定位到 `mm/fault.rs:1206/1223` |
+| 9 | QEMU 启动端口选择避开本机临时端口 | `tools/run-qemu.sh` | hostfwd bind 不再失败 |
+| 10 | **idle 循环 STI;HLT（safe_halt 语义）** + enqueue 抢占评估守卫 | `arch/x86_64/process/idle.rs`、`sched/mod.rs` | #2495 已关闭但**该修复不在 master**（master idle.rs 仍是裸 `x86::halt()`），需随本批重提 |
+| 11 | **APIC 单次武装 delta 越界告警**（原 #2491 已关闭、未进 master） | `arch/x86_64/driver/apic/apic_timer.rs` | 诊断增强，与 #2490 已合并的重标定逻辑互补 |
+
+**早前批次 PR 状态（2026-10-23 核查）**：#2479-#2483 已合并；#2484 OOM 仍 OPEN；#2490 clocksource **已合并**；#2491（APIC delta 告警）**CLOSED 且内容未进 master**；#2492（idle kick）**CLOSED**（enqueue 抢占评估已在 master，但 idle STI;HLT 仍缺）；#2493 诊断基建**已合并**；#2494 vcore **已合并**；#2495（R15 修复）按用户要求 CLOSED。
+
+**拆分与 PR**：上述修复正在拆分为独立分支/PR，明细（分支名、PR 号、合入状态、对应修复内容）记录于 `docs/ocmanager-porting/pr-split-2026-10-23.md`（由 PR 拆分任务生成/维护）。历史批次（#2479-#2495）的合入情况也一并记录在该文档。
+
+---
+
+## 4. 独立待办（与主诉无依赖）
+
+| 问题 | 状态 |
+|------|------|
+| storm 超脏 journal 重放 panic-park（嵌套 panic 守卫生效但重放未通过；浅脏盘已通过） | 待查重放路径 |
+| futex_wake `nr_wake=0` 强制唤醒 1 个（Linux 语义是 no-op） | 已发现待修 |
+| `is_kthread` 分类缺陷（WorkQueue worker 无 kthread 标记） | 已发现待修 |
+| `active_clocksource_regressed` 自旋窗 1s（注释写 1ms） | 已发现待修 |
+| IRQ 独立栈（Linux IST 语义，结构性） | 未动 |
+| 次级 syscall 缺口（AIO/fallocate/sysctl/ptrace/FAT/DAC） | 未动 |
+| QEMU >2G 且非 6G 启动挂死（D） | 未动，6G 绕过 |
+| Go 服务镜像构建与部署收尾（自启/hostfwd/文件分发） | 等内核收口 |
+| 大镜像 registry 拉取卡死 | 旁路 save/load |
+
+---
+
+## 5. 调试工具资产（探针已编入内核，随修复保留）
+
+| 工具 | 位置 | 用途 |
+|------|------|------|
+| critical 输出通道 | virtio_console.rs | 任何降级场景的可见性兜底 |
+| tmict 全量探针 | apic_timer.rs | 时钟四元组+REGRESS 判定+PMTMR 定频 |
+| uw 审计 | timekeeping.rs | 时钟速率内核侧权威判据（%4096 节流） |
+| wdtick/wdcmp | clocksource.rs | watchdog 心跳+比对原始值 |
+| apcal/aprecal | apic_timer.rs | APIC 标定取证 |
+| LSYSCALL/TrapFrame/kret | task.rs+syscall+task_dump.rs | 卡死任务 syscall 号+栈帧（信号免疫） |
+| USER BLOCK STORM | task_dump.rs | 用户态阻塞风暴自动转储 |
+| pickstat | sched/mod.rs+task_dump.rs | 每 CPU pick 计数周期报告 |
+| place 探针 | fair.rs | 唤醒 vruntime 放置审计 |
+| futex_stress2 | guest /futex_stress2（主盘内置） | 双线程压测+STUCK 探测模式（wake-probe） |
+
+**操作提示**：压测命令首次发送常丢失，需重发一次；判定时钟速率必须用 uw 探针（串口缓冲有陈旧样本伪象）；传输盘写入会被 guest 页缓存覆盖，二进制注入用停机 debugfs 写主盘 p1 分区。
+
+---
+
+## 6. 环境与操作备忘
+
+```bash
+# 编译（worktree 根，勿在 nix devshell 编 user 程序）
+make kernel
+
+# 净盘重建（~90s；每次压测/容器测试前建议净盘，脏盘会 journal park）
+sudo rm -f bin/disk-image-x86_64.img && ROOTFS_MANIFEST=docker SKIP_GRUB=1 make write_diskimage
+
+# 启动（pty 服务，Enter 激活控制台）
+cd tools && DRAGONOS_QEMU_MEMORY=6G ROOT_PATH=$PWD/.. bash run-qemu.sh --bios=legacy --display=nographic
+
+# 压测复现（命令可能要发两次）
+/futex_stress2; echo DONE
+
+# 二进制注入 guest（停机状态）
+sudo losetup -fP bin/disk-image-x86_64.img
+sudo debugfs -w -R "write /tmp/xxx xxx" /dev/loop6p1
+sudo losetup -D
+
+# 清理残留（我的 QEMU；共享服务器其他会话勿动）
+for p in $(pgrep -f 'disk-image-x86_64.img'); do sudo kill -9 $p; done
+```
+
+- 每轮修改后立即 `git add -A`（防外部重置）；禁止对 worktree 大范围 git reset/checkout。
+- QEMU 偶被其它会话 pkill 清扫（exit 137）——重启即可，无数据损失。
+- 主目录 `~/DragonOS-12` 是原仓库，勿动。
