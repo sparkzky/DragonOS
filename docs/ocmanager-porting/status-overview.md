@@ -177,6 +177,17 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 **早前批次 PR 状态（2026-10-23 核查）**：#2479-#2483 已合并；#2484 OOM 仍 OPEN；#2490 clocksource **已合并**；#2491（APIC delta 告警）**CLOSED 且内容未进 master**；#2492（idle kick）**CLOSED**（enqueue 抢占评估已在 master，但 idle STI;HLT 仍缺）；#2493 诊断基建**已合并**；#2494 vcore **已合并**；#2495（R15 修复）按用户要求 CLOSED。
 
+### 3.7 容器层验证进展（2026-10-23）
+
+| 服务 | 镜像 | 验证 | 结果 |
+|---|---|---|---|
+| MySQL | mysql:8.0.35 | 直接 `mysqld`（绕开 entrypoint 的 bash `<(...)` 缺陷） | ✅ `ready for connections`（3306）；`select version()` → `8.0.35` |
+| Redis | redis:7.2.3-alpine | `docker load` → `docker run -d` → `docker exec redis-cli ping` | ✅ `PONG`（L1=0/L2=0/R1=0/R2=0） |
+| ZooKeeper / Kafka | — | 主机无镜像，registry 拉取已知会卡死 | ⏳ 待获取镜像（save/load 旁路） |
+
+- 所有容器操作都在净盘 + 注入 tar（`/mysql8035.tar.gz`、`/redis72.tar.gz`）后进行；`docker load` 全程无挂死。
+- 官方 mysql entrypoint 仍被 bash `<(...)`+函数缺陷阻断（最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV），迁移暂用直接 `mysqld` 启动。
+
 **拆分与 PR（2026-10-23 完成）**：已拆为 9 个独立 PR：**#2507** xattr EOPNOTSUPP、**#2508** run-qemu 端口、**#2509** fault 诊断、**#2510** panic stop_this_cpu、**#2511** TLB shootdown 上下文+liveness+track_caller、**#2512** idle STI;HLT（含 enqueue 守卫）、**#2513** APIC delta 告警、**#2514** 探针治理+tmict 采样修正、**#2515** virtio-blk 停顿自检。
 - **futex 持锁睡眠未开 PR**：上游 master 的 `futex_wait()` 已实现 `read_user_u32_nofault` 锁内复查 + 缺页放锁重试（与本次本地修复等价），重复提交会冲突；本地版本随 worktree 保留，rebase 时应采用上游实现。
 - 明细（分支、SHA、逐文件覆盖审计、历史 PR 状态、未修复清单）见 `docs/ocmanager-porting/pr-split-2026-10-23.md`。
