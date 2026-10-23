@@ -238,6 +238,23 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - **验证**：修复后单独跑 kafka —— `L_KFK=0`、`RUN_KFK=0`、`docker ps` RC=0、**`kafka-topics.sh --bootstrap-list` RC=0**，shell 正常返回（此前同场景必挂死）。
 - 注意：缺页上下文本身 IF=0，shootdown 仍会打印 `initiated with interrupts disabled` 提示（信息性），但已不再与页表/rmap 锁形成死锁环。
 
+### 3.12 Compose infra 端到端验收（2026-10-23，内核 #191 / 8G）
+一次干净盘运行（4 镜像 + 4 容器 + 探活）：全部通过，无挂死。
+
+| 步骤 | 结果 |
+|---|---|
+| `docker load` mysql/redis/zk/kafka | 全部 `=0` |
+| `docker run` mdb/rds/zk/kfk | 全部 `=0`（`docker ps` 四个 `Up`） |
+| Redis `redis-cli ping` | `PONG`，RC=0 |
+| ZooKeeper `srvr` | standalone，RC=0 |
+| Kafka `kafka-topics.sh --bootstrap-server --list` | RC=0 |
+| MySQL `select version()` | `8.0.35`（容器就绪约需 30s+，首次探活过早返回 socket 缺失） |
+
+关键修复链（本轮）：
+1. `timekeeping::clocksource_delta()` 按 `max_cycles` 钳制（窄掩码不再误判回退 → 消除假死）；
+2. `do_wp_page` 的 TLB shootdown 推迟到 `page_table_edit` 放开后；
+3. 该延迟 shootdown 期间临时开中断，避免两 CPU 互相等待 ACK 的交叉死锁。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
