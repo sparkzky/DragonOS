@@ -1158,8 +1158,13 @@ impl PageFaultHandler {
         // 旧的本地 `invlpg` / 无 flush 写法会让其他 CPU 继续持有旧翻译，
         // 导致错误的重复写保护 fault 或访问到已被替换的旧物理页（风险 4 残留）。
         let end = VirtAddr::new(address.data() + MMArch::PAGE_SIZE);
+        // PTE 已更新后需要让其它 CPU 失效旧翻译。shootdown 会等待远端 ACK，
+        // 若在 `page_table_edit()` 的关中断临界区内发起，远端 CPU 可能正等
+        // 待我们持有的页表/rmap 锁，形成关中断死锁（实测 java 启动即整机停摆）。
+        // 因此这里只记录"需要 flush"，等 drop 守卫恢复中断后再统一执行。
+        let mut tlb_flush_needed = false;
 
-        if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
+        let reason = if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
             // 共享映射：原地升级 PTE 为可写，并标记脏。
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
@@ -1190,7 +1195,7 @@ impl PageFaultHandler {
 
             // PTE 从 RO 升级为 RW：其他 CPU 持有的 RO 缓存会导致它们访问时触发虚假写保护 fault，
             // 必须 mm-aware shootdown 让其它 CPU 重新 walk 最新 PTE。
-            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+            tlb_flush_needed = true;
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
             // 私有匿名映射，根据引用计数判断是否拷贝页面
@@ -1203,7 +1208,7 @@ impl PageFaultHandler {
                 entry.set_flags(new_flags);
                 table.set_entry(i, entry);
 
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+                tlb_flush_needed = true;
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
                 let new_page = match PageFaultMessage::copy_anonymous_page(&old_page, &data_account)
@@ -1220,7 +1225,7 @@ impl PageFaultHandler {
                 // hold a Linux-style per-PTE lock while every fault reader checks
                 // the PTE, so do not create a transient empty PTE here.
                 table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+                tlb_flush_needed = true;
 
                 Self::attach_fault_mapped_page(
                     &new_page,
@@ -1241,7 +1246,7 @@ impl PageFaultHandler {
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
             table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
-            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+            tlb_flush_needed = true;
 
             Self::attach_fault_mapped_page(
                 &new_page,
@@ -1250,7 +1255,15 @@ impl PageFaultHandler {
             );
             Self::detach_fault_mapped_page(&old_page, &vma);
             VmFaultReason::VM_FAULT_COMPLETED
+        };
+
+        // 页表编辑临界区已退出（中断恢复），此时发起 mm-aware shootdown 不会再
+        // 与远端 CPU 竞争页表/rmap 锁。
+        drop(_pt_edit);
+        if tlb_flush_needed {
+            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
         }
+        reason
     }
 
     /// 缺页附近页预读
