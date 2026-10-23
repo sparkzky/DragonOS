@@ -1264,8 +1264,32 @@ impl Ext4FileSystem {
                                 fs.fs
                                     .commit_inode_metadata(inode_num, size, atime, mtime, ctime)
                             })
+                            .map_err(|e| {
+                                // 临时诊断：commit_inode_metadata 的失败来源。
+                                use core::sync::atomic::{AtomicU64, Ordering};
+                                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                                let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                                if n < 8 || n % 1024 == 0 {
+                                    crate::print_critical!(
+                                        "flush_inode: commit failed inode={} err={:?} size={:?} dirty={:?}\n",
+                                        inode_num, e, size, snapshot_dirty
+                                    );
+                                }
+                                e
+                            })
                         })
                     } else {
+                        // 临时诊断：fs_ptr 已失效（superblock 被卸载/失效）。
+                        use core::sync::atomic::{AtomicU64, Ordering};
+                        static LOGGED: AtomicU64 = AtomicU64::new(0);
+                        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 || n % 1024 == 0 {
+                            crate::print_critical!(
+                                "flush_inode: fs_ptr upgrade failed inode={} dirty={:?}\n",
+                                inode_num,
+                                snapshot_dirty
+                            );
+                        }
                         Err(SystemError::EIO)
                     };
 

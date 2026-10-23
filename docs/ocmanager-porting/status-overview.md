@@ -226,6 +226,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 修复：对齐 Linux 6.6 `timekeeping_get_delta()` —— **不做方向推断**，统一 `raw.min(max_cycles)`；`max_cycles=min(u64::MAX/max_mult, mask)` 已把单次跳变限制在秒级。持续性倒走仍由 `active_clocksource_regressed()` watchdog 自检触发降级重选（每 64 次超窗读数唤醒一次）。
 - 附带修正：`invdet` 打印格式参数错位（`mask=` 为空），改为只打印 `now/last/raw/max`。
 
+### 3.10 EIO 下钻与真实阻塞（2026-10-23 晚）
+- 时钟修复后（#185/#186/#189）：**4 镜像连续加载 100% 成功**，楔死消失；`docker run` redis/mysql/zookeeper 成功。
+- 诊断（#186）确认 `flush_dirty_inodes` 的 EIO 来自 `commit_inode_metadata`（`fs_ptr` 正常），并且在 #189（加入 `commit_error`/`fail`/短写诊断）**未复现**——说明该 EIO 是重负载/内存压力下的次级现象，而非确定性的元数据写错误。
+- 新硬阻塞：`[alloc-exhausted] size=131072 align=8; parking task, kernel alive` + `[oom-kill] ... victim_tgid=234` + `[page-fault-OOM]`。即 **6G 内存在 mysql+zk+kafka 容器创建阶段被耗尽**，Rust 全局分配失败进入 `alloc_error_handler` 的 park 循环，表现为 `docker run` 永久挂起（与 2-e 同机制）。
+- 下一步：把 QEMU 内存从 6G 提高（验证 8G 是否可用；已知“非 6G 挂死”记录需复核），并按 Linux 语义把容器内存计入 cgroup/回收，避免全局堆耗尽。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |

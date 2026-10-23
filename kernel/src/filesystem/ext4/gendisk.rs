@@ -210,6 +210,10 @@ impl another_ext4::BlockDevice for GenDisk {
                 another_ext4::Ext4Error::new(code)
             })?;
         if completed != another_ext4::BLOCK_SIZE {
+            crate::print_critical!(
+                "gendisk: short write_block lba={} count={} completed={}\n",
+                lba_start, lba_count, completed
+            );
             return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
         }
         Ok(())
@@ -247,6 +251,10 @@ impl another_ext4::BlockDevice for GenDisk {
                     another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
                 })?;
             if completed != chunk.len() {
+                crate::print_critical!(
+                    "gendisk: short write_blocks start={} blocks={} completed={} want={}\n",
+                    chunk_start, ext4_blocks, completed, chunk.len()
+                );
                 return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
             }
         }

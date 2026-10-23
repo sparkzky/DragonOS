@@ -766,6 +766,19 @@ impl Transaction<'_> {
         failure: CommitFailure,
         poison: bool,
     ) -> core::result::Result<T, CommitError> {
+        {
+            static LOGGED: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let n = LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 256 == 0 {
+                log::error!(
+                    "ext4 commit fail: code={:?} stage={:?} poison={}\n",
+                    error.code(),
+                    failure,
+                    poison
+                );
+            }
+        }
         if poison {
             match self.core {
                 TransactionCoreRef::Journal(core) => core.poison(),
@@ -840,6 +853,20 @@ impl JournalTransactionCore {
         failure: CommitFailure,
         poison: bool,
     ) -> core::result::Result<T, CommitError> {
+        // 临时诊断：定位 commit 失败的阶段与错误码。
+        {
+            static LOGGED: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let n = LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 256 == 0 {
+                log::error!(
+                    "ext4 commit_error: code={:?} stage={:?} poison={}\n",
+                    error.code(),
+                    failure,
+                    poison
+                );
+            }
+        }
         if poison {
             self.poison();
         }
