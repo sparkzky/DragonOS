@@ -188,12 +188,15 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | Kafka | confluentinc/cp-kafka:7.5.0（416MB tar） | `docker load` | ❌ 挂死：中途停止写盘（盘零增长），Ctrl+C 无效 |
 | Kafka（换源复测） | bitnamilegacy/kafka:3.5.1（335MB tar） | 连续多次 load 时 | ❌ 同样挂死 |
 | **Kafka（单独 load 复测）** | 同镜像，全新净盘 + 后台 load + 定时探针 | ✅ **`K_LOAD=0`、`Loaded image`、“Loading containers: done”**（<5 分钟） | ⇒ 楔死**不是镜像本身**，而是**连续多次大镜像 load 后的累积状态**或偶发；需按“逐个 load + 校验 + 资源检查”方式推进 |
+| **Kafka（KRaft 运行）** | bitnamilegacy/kafka:3.5.1，`--env-file` KRaft 配置（免 ZooKeeper） | ✅ 容器启动 `K1=0`；`kafka-topics.sh --bootstrap-server localhost:9092 --list` → **K2=0**（AdminClient 连通） | JVM 日志中的 `java No mapped vma`（addr 0/8）是 HotSpot 隐式空检查，属正常语义，非崩溃 |
 | ClickHouse | clickhouse-server:23.8.8.20 | 未开始 | ⏸ 排在 kafka 之后 |
 
 - 所有容器操作都在净盘 + 注入 tar（`/mysql8035.tar.gz`、`/redis72.tar.gz`）后进行；`docker load` 全程无挂死。
 - 官方 mysql entrypoint 仍被 bash `<(...)`+函数缺陷阻断（最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV），迁移暂用直接 `mysqld` 启动。
 
-- **负载期时钟偏差（新观察）**：kafka load 进行时 clocksource watchdog 报 `cs_dev_nsec=504000000` vs `wd_dev_nsec=577876797`——kvm-clock 相对 acpi_pm 慢约 13%。此前的“时钟健康”结论基于无故障时的采样；高 IO 负载下存在真实速率偏差，需复查（与 R16SRC 探针结论不矛盾：当时采样的窗口无偏差）。
+- **时钟偏差复现（补充）**
+- **时钟偏差复现（重要）**：多次 watchdog 输出呈 `cs=504000000` vs `wd=577~784ms`（kvm-clock 相对 acpi_pm 慢 13%~36%），且与负载无关（空闲时也出现）。这说明 kvm-clock **速率本身**在 DragonOS 上不稳定，需按 R9-R13 的方法复测（PMTMR 交叉 + 是否触发自贬/切换 acpi_pm）。此前"100.1% 速率"结论只在特定窗口成立。
+此前（上一轮）的观察：：kafka load 进行时 clocksource watchdog 报 `cs_dev_nsec=504000000` vs `wd_dev_nsec=577876797`——kvm-clock 相对 acpi_pm 慢约 13%。此前的“时钟健康”结论基于无故障时的采样；高 IO 负载下存在真实速率偏差，需复查（与 R16SRC 探针结论不矛盾：当时采样的窗口无偏差）。
 - **大镜像 load 楔死**：mysql(162MB tar)/redis/zk 均 LOAD=0；cp-kafka(416MB tar) 卡死。下一步方向：① 用 `/tmp/dockerd.log` 与任务转储定位（需可交互 guest）；② 分块加载该镜像层（逐层 `docker load`）；③ 检查是否与 overlayfs/快照解包路径相关。
 
 
