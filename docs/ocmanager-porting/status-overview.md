@@ -7,7 +7,7 @@
 
 ## 0. 一句话现状
 
-**R15 调度饥饿与 R16 死锁均已修复并验证**（`docker load` 全程零 panic/spinout，BADHALT 洪泛消失），修复已拆为 9 个 PR（#2507-#2515）。**容器层已跑通 MySQL（`ready for connections` + SQL 查询）与 Redis（`PONG`）**。
+**R15 调度饥饿与 R16 死锁均已修复并验证**（`docker load` 全程零 panic/spinout，BADHALT 洪泛消失），修复已拆为 9 个 PR（#2507-#2515）。**容器层已跑通 MySQL（`ready for connections` + SQL 查询）、Redis（`PONG`）与 Kafka（KRaft，`kafka-topics --list` RC=0）**。
 当前剩余阻断按优先级：① **大镜像 `docker load` 楔死**（cp-kafka 416MB，mysql/redis/zk 正常）；② **bash `<(函数)` 崩溃**（父 bash SIGSEGV，阻断官方 mysql entrypoint，已最小复现）；③ **负载期 kvm-clock 较 acpi_pm 慢 ~13%**（watchdog 实测）；④ `fault.rs:1206/1223` 关中断 shootdown（仅 pinpoint）；⑤ 容器崩溃后 `docker run` 挂起（2-e）。
 
 ---
@@ -196,7 +196,7 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 - **时钟速率实测（2026-10-23）**：guest `date +%s` 在宿主 148s 真实时间内前进 147s（**99.3%**）⇒ kvm-clock **平均速率准确**。
 - **watchdog 差异的细化判读**：`cs_dev_nsec` 恒为 504000000（同一个窗口值）而 `wd_dev_nsec` 在 577~784ms 间波动 ⇒ 更可能是 **kvm-clock 在这些短窗口内被冻结/钳制**（`kvm_clock::read()` 的 fetch_max 单调钳制 + 冻结检测），而非 acpi_pm 换算错误（acpi_pm mult=558/shift=1 经计算速率正确）。平均 99.3% 说明冻结是**间歇性**的（累计 ~1s/148s）。
-- 影响与后续：间歇冻结会造成定时器/超时抖动；需在 watchdog 打印点附近采样连续 tmict（临时把 `TMICT_PRINT` 打开），确认是 pvti 停更还是钳制触发；并检查冻结检测是否按时自贬/切换。日志中**无 reselection** 说明降级路径未落地。
+- 未决点：watchdog 偏差 (280ms) 远超 `WATCHDOG_THRESHOLD=62.5ms`，但串口未见 `cs_dev_nsec = ...`（unstable 分支）打印——可能是运行期 `info!` 被日志级别过滤，或该源已被标记 unstable 并已切到 acpi_pm（后续比对仍读 kvm）。**下一步**：① 临时打开 `TMICT_PRINT` 并在 watchdog 分支加 print_critical（放锁后）确认降级是否发生；② 提供 `/sys` 查询当前 clocksource（若无则加只读接口）以便直接判定。
 - **旧观察（已作废）**
 - **时钟偏差复现（重要）**：多次 watchdog 输出呈 `cs=504000000` vs `wd=577~784ms`（kvm-clock 相对 acpi_pm 慢 13%~36%），且与负载无关（空闲时也出现）。这说明 kvm-clock **速率本身**在 DragonOS 上不稳定，需按 R9-R13 的方法复测（PMTMR 交叉 + 是否触发自贬/切换 acpi_pm）。此前"100.1% 速率"结论只在特定窗口成立。
 此前（上一轮）的观察：：kafka load 进行时 clocksource watchdog 报 `cs_dev_nsec=504000000` vs `wd_dev_nsec=577876797`——kvm-clock 相对 acpi_pm 慢约 13%。此前的“时钟健康”结论基于无故障时的采样；高 IO 负载下存在真实速率偏差，需复查（与 R16SRC 探针结论不矛盾：当时采样的窗口无偏差）。
