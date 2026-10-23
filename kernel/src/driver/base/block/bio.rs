@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{libs::spinlock::SpinLock, mm::dma::DmaBuffer, sched::completion::Completion};
+use crate::{libs::spinlock::SpinLock, mm::dma::DmaBuffer, sched::completion::Completion, time::clocksource::HZ};
 
 use super::block_device::{BlockId, LBA_SIZE};
 
@@ -246,13 +246,50 @@ impl BioRequest {
         }
     }
 
+    /// 等待完成，并在长时间无进展时输出有限的诊断日志。
+    ///
+    /// 探针只观测、不改变等待语义：完成/中断的返回值与直接睡眠完全一致。
+    /// 以 1 秒为粒度分段等待；超过阈值后按衰减节奏输出至多 3 条告警，
+    /// 用于区分“慢”与“卡死”，并依据 `state`（Init=从未提交到设备、
+    /// Submitted=已提交未完成）定位卡死发生在提交侧还是完成侧。
+    /// 这是早期启动阶段唯一的现场信息来源。
+    fn wait_completion_probed(&self) -> Result<(), SystemError> {
+        const PROBE_TICKS: i64 = HZ as i64;
+        let mut waited_seconds: u64 = 0;
+        let mut reported: u32 = 0;
+        loop {
+            // 必须先克隆 completion 并释放 inner 锁再睡眠，
+            // 否则完成路径（IRQ/tasklet 上下文）会在 inner 锁上自旋。
+            let completion = self.inner.lock_irqsave().completion.clone();
+            let result = completion.wait_for_completion_timeout(PROBE_TICKS);
+            match result {
+                // Ok(0) 表示本轮超时；Ok(>=1) 表示已完成。
+                Ok(remaining) if remaining >= 1 => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+            waited_seconds += 1;
+            let threshold = 5 + 10 * reported as u64;
+            if waited_seconds >= threshold && reported < 3 {
+                reported += 1;
+                let inner = self.inner.lock_irqsave();
+                log::warn!(
+                    "block bio stuck {}s: type={:?} lba={} sectors={} state={:?} token={:?}",
+                    waited_seconds,
+                    inner.bio_type,
+                    inner.lba_start,
+                    inner.count,
+                    inner.state,
+                    inner.token,
+                );
+            }
+        }
+    }
+
     /// 等待BIO完成并返回结果
     pub fn wait(&self) -> Result<Vec<u8>, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-
-        // 等待完成
-        completion.wait_for_completion()?;
-
+        self.wait_completion_probed()?;
+        // 完成等待已由 wait_completion_probed 完成（含卡死诊断）。
         // 获取结果
         let inner = self.inner.lock_irqsave();
         match inner.result.as_ref() {
@@ -269,8 +306,7 @@ impl BioRequest {
     /// into the caller's buffer. This avoids the intermediate `Vec` allocated
     /// by [`Self::wait`] and never exposes the DMA buffer pointer after submit.
     pub fn wait_read_into(&self, dst: &mut [u8]) -> Result<usize, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-        completion.wait_for_completion()?;
+        self.wait_completion_probed()?;
 
         let (source, expected) = {
             let inner = self.inner.lock_irqsave();
@@ -298,8 +334,7 @@ impl BioRequest {
     /// Wait for completion without copying the DMA payload. This is the
     /// completion path for writes and flushes.
     pub fn wait_status(&self) -> Result<usize, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-        completion.wait_for_completion()?;
+        self.wait_completion_probed()?;
 
         let inner = self.inner.lock_irqsave();
         match inner.result.as_ref() {

@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     fmt::{Debug, Formatter, Write},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -14,6 +14,7 @@ use bitmap::{static_bitmap, traits::BitMapOps};
 use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
+use crate::time::Duration;
 use unified_init::macros::unified_init;
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, VirtIOBlk, SECTOR_SIZE},
@@ -303,6 +304,14 @@ enum VirtIOBlkState {
 
 static mut VIRTIO_BLK_DRIVER: Option<Arc<VirtIOBlkDriver>> = None;
 
+// 块 IO 停顿诊断计数。全部为普通原子操作，**只在进程上下文**（IO 线程的
+// 超时自检）打印，绝不在 IRQ/tasklet 上下文做 console 输出。
+static VBLK_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+static VBLK_TASKLET_SCHED: AtomicU64 = AtomicU64::new(0);
+static VBLK_TASKLET_RUN: AtomicU64 = AtomicU64::new(0);
+static VBLK_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static VBLK_STALL_REPORTS: AtomicU64 = AtomicU64::new(0);
+
 /// 中断下半部：完成 BIO 请求
 struct BioCompletionTasklet {
     token_map: Arc<BioTokenMap>,
@@ -332,10 +341,12 @@ impl BioCompletionTasklet {
     }
 
     fn schedule(&self) {
+        VBLK_TASKLET_SCHED.fetch_add(1, Ordering::Relaxed);
         tasklet_schedule(&self.tasklet);
     }
 
     fn run(&self) {
+        VBLK_TASKLET_RUN.fetch_add(1, Ordering::Relaxed);
         let device = match self.device.upgrade() {
             Some(dev) => dev,
             None => return,
@@ -1114,6 +1125,7 @@ impl VirtIODevice for VirtIOBlkDevice {
             None => return Ok(crate::exception::irqdesc::IrqReturn::NotHandled),
         };
 
+        VBLK_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
         let acked = device_inner.ack_interrupt();
         if !acked && !inner.irq_is_msix {
             log::debug!(
@@ -1594,29 +1606,55 @@ fn submit_bio_wait(
     bio: &Arc<BioRequest>,
 ) -> Result<(), SystemError> {
     let mut result = None;
-    device.submission_wait.wait_event_uninterruptible(
-        || {
-            if result.is_some() {
-                return true;
-            }
-            match submit_bio_to_virtio(device, bio.clone()) {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if P6_2_STATS_ENABLED {
-                        device
-                            .stats
-                            .queue_full_retries
-                            .fetch_add(1, Ordering::Relaxed);
+    // 1 秒超时循环：既保持"不可中断等待完成"的语义，又让停滞可观测。
+    // 超时只在进程上下文（IO 线程）打印计数，用于区分 IRQ / tasklet /
+    // 完成回收三段中哪一段停止。
+    let mut stalls: u32 = 0;
+    loop {
+        let waited = device.submission_wait.wait_event_uninterruptible_timeout(
+            || {
+                if result.is_some() {
+                    return true;
+                }
+                match submit_bio_to_virtio(device, bio.clone()) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        if P6_2_STATS_ENABLED {
+                            device
+                                .stats
+                                .queue_full_retries
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        false
                     }
-                    false
+                    terminal => {
+                        result = Some(terminal);
+                        true
+                    }
                 }
-                terminal => {
-                    result = Some(terminal);
-                    true
+            },
+            Some(Duration::from_secs(1)),
+        );
+        match waited {
+            Ok(()) => break,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                stalls = stalls.saturating_add(1);
+                if stalls % 5 == 0 {
+                    let n = VBLK_STALL_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        crate::print_critical!(
+                            "vblk stall {}s: irq={} sched={} run={} completed={}\n",
+                            stalls,
+                            VBLK_IRQ_COUNT.load(Ordering::Relaxed),
+                            VBLK_TASKLET_SCHED.load(Ordering::Relaxed),
+                            VBLK_TASKLET_RUN.load(Ordering::Relaxed),
+                            VBLK_COMPLETED.load(Ordering::Relaxed)
+                        );
+                    }
                 }
             }
-        },
-        None::<fn()>,
-    )?;
+            Err(error) => return Err(error),
+        }
+    }
     result.expect("submission wait completed without a terminal result")
 }
 

@@ -127,7 +127,7 @@ QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="${DRAGONOS_QEMU_DISK_IMAGE:-../bin/${DISK_NAME}}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
-QEMU_MEMORY="2G"
+QEMU_MEMORY="${DRAGONOS_QEMU_MEMORY:-2G}"
 PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-}"
 PMEM_SIZE="${PMEM_SIZE:-}"
 QEMU_ENABLE_PMEM="${QEMU_ENABLE_PMEM:-false}"
@@ -273,8 +273,12 @@ setup_pmem_support
 find_free_port() {
     local start_port=$1
     local port=$start_port
+    # 除监听套接字外，也要避开已被“本地临时端口”占用的端口：QEMU 的
+    # hostfwd 需要 bind，而与本机某个出向连接（例如 API 客户端）同号的
+    # 临时端口会让 bind 直接失败（EADDRINUSE），启动即退出。
     while netstat -tuln 2>/dev/null | grep -q ":${port} " || \
-          ss -tuln 2>/dev/null | grep -q ":${port} "; do
+          ss -tuln 2>/dev/null | grep -q ":${port} " || \
+          ss -tan 2>/dev/null | grep -q ":${port} "; do
         port=$((port + 1))
     done
     echo $port

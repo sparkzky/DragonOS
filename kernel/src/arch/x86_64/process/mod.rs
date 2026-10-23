@@ -595,16 +595,49 @@ impl ProcessControlBlock {
 
         // 从内核栈的最低地址处取出pcb的地址
         let p = stack_base.data() as *const *const ProcessControlBlock;
-        if unlikely((unsafe { *p }).is_null()) {
+        let slot = unsafe { *p };
+        if unlikely(slot.is_null()) {
             error!("p={:p}", p);
             panic!("current_pcb is null");
+        }
+        // 栈底 PCB 槽被写坏时（历史样本：errno -15、布尔 0x1、以及形如
+        // 附近内核指针截断的 0x1c01d6023），先转储栈底 32 字节再判型：
+        // 深栈溢出的槽上方是连续的栈帧数据（保存的寄存器/返回地址呈
+        // 0xffff8... 内核地址模式）；DMA/随机覆写则无此模式。两个必要
+        // 条件（8 字节对齐 + 直接映射区下界）对合法 PCB 恒真、零误杀。
+        let slot_misaligned = (slot as usize) & 0x7 != 0;
+        let slot_below_map = (slot as usize) < 0xffff_8000_0000_0000;
+        if unlikely(slot_misaligned || slot_below_map) {
+            unsafe {
+                let dump = core::slice::from_raw_parts(p as *const u64, 4);
+                error!(
+                    "current_pcb slot vicinity: {:#018x} {:#018x} {:#018x} {:#018x}",
+                    dump[0], dump[1], dump[2], dump[3]
+                );
+            }
+        }
+        if unlikely(slot_misaligned) {
+            panic!(
+                "current_pcb slot corrupted (not aligned): stack_base={:#x}, value={:#x} — kernel stack overflow or stray write?",
+                stack_base.data(),
+                slot as usize
+            );
+        }
+        if unlikely(slot_below_map) {
+            panic!(
+                "current_pcb slot corrupted (outside kernel direct map): stack_base={:#x}, value={:#x}",
+                stack_base.data(),
+                slot as usize
+            );
         }
         unsafe {
             // 为了防止内核栈的pcb weak 指针被释放，这里需要将其包装一下
             let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
-                ManuallyDrop::new(Weak::from_raw(*p));
+                ManuallyDrop::new(Weak::from_raw(slot));
 
-            let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
+            let new_arc: Arc<ProcessControlBlock> = weak_wrapper
+                .upgrade()
+                .expect("current_pcb weak upgrade failed (pcb freed?)");
             return new_arc;
         }
     }
@@ -1028,15 +1061,12 @@ pub(crate) fn stop_this_cpu() -> ! {
     CurrentApic.disable_local_apic();
     smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
+    // 停机循环必须是纯指令：本函数也会从 panic 路径进入（可能由内存耗尽
+    // 触发，且已关中断）。每次 hlt 被 NMI/wakeup 唤醒都不得再打印或分配，
+    // 否则就是 "console in IF=0" 类的缺陷，并可能在 OOM panic 上二次级联。
     loop {
-        native_halt();
-    }
-}
-
-#[inline(always)]
-fn native_halt() {
-    info!("Starting System Halt...");
-    unsafe {
-        asm!("hlt", options(nomem, nostack, preserves_flags));
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }

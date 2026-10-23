@@ -955,6 +955,7 @@ impl AddressSpace {
     ///
     /// See `crate::mm::tlb::flush_tlb_mm_range` for constraints.
     #[inline]
+    #[track_caller]
     pub fn flush_tlb_range(
         self: &Arc<Self>,
         start: VirtAddr,

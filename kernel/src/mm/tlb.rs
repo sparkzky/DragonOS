@@ -15,7 +15,7 @@
 //! - INV-5: When `freed_tables == true`, the receiving end must handle it (simplified: in this iteration the sender
 //!   sends to all active CPUs regardless, and the receiver unconditionally executes).
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use core::{hint::spin_loop, sync::atomic::AtomicBool};
@@ -43,6 +43,16 @@ use crate::libs::spinlock::SpinLock;
 
 /// Sentinel end value meaning "flush the entire mm"; combined with start=0 it means "do not use range-based flush".
 pub const TLB_FLUSH_ALL: VirtAddr = VirtAddr::new(usize::MAX);
+
+/// Number of `spin_loop()` iterations after which a still-unacknowledged
+/// shootdown target is reported once. A live target acknowledges within a few
+/// microseconds; reaching this bound means the target is wedged, which is a bug
+/// worth surfacing even though the initiator must keep waiting for correctness.
+const CSD_STALL_WARN_SPINS: u64 = 50_000_000;
+
+/// Entry-point identifiers reported by [`TLB_DIAG`].
+pub const SHOOTDOWN_ENTRY_MM_RANGE: usize = 0;
+pub const SHOOTDOWN_ENTRY_KERNEL_RANGE: usize = 1;
 
 /// Cf. Linux `tlb_single_page_flush_ceiling`: above this threshold, fall back to full-mm flush.
 pub const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
@@ -397,13 +407,36 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             send_ipi(IpiKind::FlushTLB, IpiTarget::Specified(cpu));
         }
 
-        // Poll for done
+        // Poll for done.
+        //
+        // Liveness: a target CPU that has left `Online` (panic/halt or hot-unplug)
+        // will never execute `remote_flush_tlb_on_ipi` again, so it can never
+        // acknowledge. It also executes no further memory accesses, which means the
+        // shootdown it was asked to perform is moot — continuing to wait would pin
+        // the initiator (preemption is disabled and the caller may hold locks)
+        // forever and turn a local CPU failure into a machine-wide hang.
+        // So: stop waiting as soon as the target is observed to be non-online.
         for cpu in active.iter_cpu() {
             if cpu == my_cpu {
                 continue;
             }
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
+            let mut spins = 0u64;
             while !csd.done.load(Ordering::Acquire) {
+                spins += 1;
+                // Checking the (cross-CPU) hotplug state on every iteration would
+                // add pointless global traffic to the normal microsecond-scale
+                // acknowledgement window; a target that goes away stays away.
+                if spins & 1023 == 0 && !smp_cpu_manager().is_online_cpu(cpu) {
+                    break;
+                }
+                if spins == CSD_STALL_WARN_SPINS {
+                    // Should be unreachable: a live target acks within
+                    // microseconds. Do not abort (INV-3 needs the ack); only
+                    // record it — the watchdog prints it from process context.
+                    TLB_DIAG.csd_stall_cpu.store(cpu.data() as usize, Ordering::Relaxed);
+                    TLB_DIAG.csd_stalls.fetch_add(1, Ordering::Relaxed);
+                }
                 spin_loop();
             }
             // Clean up CSD slot to prevent misuse
@@ -429,12 +462,87 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
     }
 }
 
+/// Deferred, allocation-free diagnostics for the TLB shootdown path.
+///
+/// Both counters below are recorded **at the site where the anomaly is
+/// observed** — which may be an interrupt-disabled / lock-holding context — and
+/// printed later by the stall watchdog in process context. Printing at the
+/// observation site would re-introduce the very defect this module is fixing
+/// ("console output inside an IRQ-off critical section").
+#[derive(Debug, Default)]
+pub struct TlbDiag {
+    /// Number of shootdowns initiated with interrupts disabled.
+    pub irqoff_events: AtomicUsize,
+    /// `cpu << 8 | entry` of the most recent such event (`entry`: 0 = mm range, 1 = kernel range).
+    pub irqoff_origin: AtomicUsize,
+    /// Number of CSD waits that exceeded `CSD_STALL_WARN_SPINS`.
+    pub csd_stalls: AtomicUsize,
+    /// Target CPU of the most recent stalled CSD wait.
+    pub csd_stall_cpu: AtomicUsize,
+    /// `file`/`line` of the most recent IRQ-off initiation site (static str).
+    pub irqoff_file_ptr: AtomicUsize,
+    pub irqoff_file_len: AtomicUsize,
+    pub irqoff_line: AtomicUsize,
+}
+
+pub static TLB_DIAG: TlbDiag = TlbDiag {
+    irqoff_events: AtomicUsize::new(0),
+    irqoff_origin: AtomicUsize::new(0),
+    csd_stalls: AtomicUsize::new(0),
+    csd_stall_cpu: AtomicUsize::new(0),
+    irqoff_file_ptr: AtomicUsize::new(0),
+    irqoff_file_len: AtomicUsize::new(0),
+    irqoff_line: AtomicUsize::new(0),
+};
+
+/// Verify the context required to *initiate* a synchronous cross-CPU shootdown.
+///
+/// The initiator must run with interrupts enabled, exactly like Linux
+/// `flush_tlb_mm_range()` (which is entered from process context and waits for
+/// acknowledgements in a preemption-disabled but interruptible region). Two
+/// reasons:
+///
+/// - While waiting for acknowledgements the initiator itself must be able to
+///   take another CPU's `FlushTLB` IPI; otherwise two initiators that both want
+///   the (target-owned) CSD slots can wait on each other.
+/// - An IRQ taken inside the caller's atomic region can re-enter
+///   `__schedule_inner()` and try to take the runqueue lock that the interrupted
+///   frame already holds — a self-deadlock that ends in a `self_lock` spinout
+///   panic. The old implementation papered over the "caller had IRQs disabled"
+///   case by temporarily enabling interrupts and restoring the caller's state
+///   afterwards; that violates the caller's atomicity guarantee and is exactly
+///   how the scheduler self-deadlock above can be reached.
+///
+/// Callers with interrupts disabled are therefore a defect. The violation is
+/// recorded here (atomically, no output) and reported by the stall watchdog.
+#[inline]
+#[track_caller]
+fn check_shootdown_context(entry_code: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if !CurrentIrqArch::is_irq_enabled() {
+        TLB_DIAG
+            .irqoff_origin
+            .store(((smp_get_processor_id().data() as usize) << 8) | entry_code, Ordering::Relaxed);
+        let loc = core::panic::Location::caller();
+        TLB_DIAG
+            .irqoff_file_ptr
+            .store(loc.file().as_ptr() as usize, Ordering::Relaxed);
+        TLB_DIAG
+            .irqoff_file_len
+            .store(loc.file().len(), Ordering::Relaxed);
+        TLB_DIAG.irqoff_line.store(loc.line() as usize, Ordering::Relaxed);
+        TLB_DIAG.irqoff_events.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = entry_code;
+}
+
 /// Range-based TLB flush for the specified mm.
 ///
 /// - `start`: start virtual address
 /// - `end`: end virtual address (exclusive). If equal to `TLB_FLUSH_ALL`, flush the entire mm.
 /// - `stride_shift`: page size shift (typically `MMArch::PAGE_SHIFT`)
 /// - `freed_tables`: whether page-table pages were also freed
+#[track_caller]
 pub fn flush_tlb_mm_range(
     mm: &Arc<AddressSpace>,
     start: VirtAddr,
@@ -442,22 +550,15 @@ pub fn flush_tlb_mm_range(
     stride_shift: u8,
     freed_tables: bool,
 ) {
-    // Serialize before disabling local interrupts. If a CPU spins for the
-    // shootdown CSD slots with IRQs disabled, it cannot service another CPU's
-    // TLB IPI, and two concurrent flush initiators can deadlock.
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    check_shootdown_context(SHOOTDOWN_ENTRY_MM_RANGE);
+
+    // Serialize initiators: the per-target CSD slot can only carry one in-flight
+    // request. This lock is acquired with interrupts enabled (see
+    // `check_shootdown_context`), so a CPU parked on it can still acknowledge a
+    // shootdown addressed to it. Holding it also disables preemption, which keeps
+    // `info` (a stack object) alive and this CPU pinned for the whole protocol.
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
-
-    // Disable interrupts to protect the entire initiation process:
-    // - Prevent migration during inc_tlb_gen and snapshot of active_cpus;
-    // - Prevent being scheduled out while waiting for IPI ack.
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // Publish barrier: ensure page table writes are visible to other CPUs before the generation increment.
     compiler_fence(Ordering::SeqCst);
@@ -503,12 +604,6 @@ pub fn flush_tlb_mm_range(
     }
 
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Synchronously invalidate a kernel address-space range on every online CPU.
@@ -517,17 +612,13 @@ pub fn flush_tlb_mm_range(
 /// independent from any user `AddressSpace` and its TLB generation. Callers must publish PTE
 /// changes before invoking this function and must not free intermediate page-table pages until it
 /// returns.
+#[track_caller]
 pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool) {
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    check_shootdown_context(SHOOTDOWN_ENTRY_KERNEL_RANGE);
+
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
 
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     compiler_fence(Ordering::SeqCst);
     let this_cpu = smp_get_processor_id();
     let info = FlushTlbInfo {
@@ -550,12 +641,6 @@ pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool
     }
     local_flush_tlb_func(&info);
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Convenience wrapper for full-mm flush

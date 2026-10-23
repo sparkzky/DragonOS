@@ -212,6 +212,15 @@ impl Drop for MmuGather<'_> {
         if !self.finished {
             // Normal path must call finish() explicitly; this is a fallback to avoid
             // missing a flush during panic unwind.
+            //
+            // Note: this path can run with interrupts disabled (panic/unwind), which
+            // violates the "shootdown initiator must be interruptible" precondition of
+            // `mm::tlb::flush_tlb_*`. It is tolerated because (a) the shootdown still
+            // completes for as long as the targets are alive, (b) the initiator holds
+            // the serializing CSD lock, so any CPU waiting for its own shootdown is
+            // able to acknowledge ours, and (c) skipping the flush here would free
+            // pages that remote CPUs can still reach. Violations are recorded in
+            // `mm::tlb::TLB_DIAG` and reported by the stall watchdog.
             self.flush_mmu_tlbonly();
             self.flush_mmu_free();
         }

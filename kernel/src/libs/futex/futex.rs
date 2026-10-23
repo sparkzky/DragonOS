@@ -159,6 +159,11 @@ impl FutexHashBucket {
             .for_each(drop);
         before != self.chain.len()
     }
+
+    /// R15 探针：waker 是否仍在队列中（不修改）
+    pub fn contains_waker(&self, waker: &Arc<Waker>) -> bool {
+        self.chain.iter().any(|x| Arc::ptr_eq(&x.waker, waker))
+    }
 }
 
 #[derive(Debug)]
@@ -368,7 +373,6 @@ impl Futex {
         if bitset == 0 {
             return Err(SystemError::EINVAL);
         }
-
         // 获取全局hash表的key值
         let key = Self::get_futex_key(
             uaddr,
@@ -376,30 +380,18 @@ impl Futex {
             FutexAccess::FutexRead,
         )?;
 
-        let mut futex_map_guard = FutexData::futex_map();
-        let bucket = futex_map_guard.get_mut(&key);
-        let bucket_mut = match bucket {
-            Some(bucket) => bucket,
-            None => {
-                let bucket = FutexHashBucket::new();
-                futex_map_guard.insert(key.clone(), bucket);
-                futex_map_guard.get_mut(&key).unwrap()
-            }
-        };
-
-        // 使用UserBuffer读取futex
+        // Linux futex_wait_setup 语义：
+        // 1) 先在**不持锁**的可睡眠上下文中读取用户字（缺页时在此合法睡眠）；
+        // 2) 持 futex_map 锁后只用 pagefault-disabled 方式复查——此路径绝不睡眠；
+        //    若复查缺页，放锁后在锁外完成映射再重试。
+        // 旧实现持全局 futex_map 锁调用可睡眠的 copy_from_user：用户页一旦缺页，
+        // 持锁任务睡眠 ⇒ 全体 futex 系统调用阻塞（R16 现场：docker/dockerd/
+        // containerd/busybox 全部 Blocked 在 futex 上，ctxsw 零增长）。
         let user_reader =
             UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
 
-        // 从用户空间读取到futex的val
-        let mut uval = 0;
-
-        // 读取
-        // 这里只尝试一种方式去读取用户空间，与linux不太一致
-        // 对于linux，如果bucket被锁住时读取失败，将会将bucket解锁后重新读取
+        let mut uval = 0u32;
         user_reader.copy_one_from_user::<u32>(&mut uval, 0)?;
-
-        // 不满足wait条件，返回错误
         if uval != val {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -434,17 +426,48 @@ impl Futex {
             bitset,
             tid: 0,
         });
-        bucket_mut.enqueue(futex_q.clone());
 
-        // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
-        if let Some(ref t) = timer {
-            t.activate();
+        loop {
+            let mut futex_map_guard = FutexData::futex_map();
+
+            let recheck = {
+                let _pf = PageFaultDisabledGuard::new();
+                user_reader.copy_one_from_user::<u32>(&mut uval, 0)
+            };
+            if recheck.is_err() {
+                // 页不在内存：放锁，在可睡眠上下文完成映射后重试。
+                drop(futex_map_guard);
+                user_reader.copy_one_from_user::<u32>(&mut uval, 0)?;
+                if uval != val {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                continue;
+            }
+            if uval != val {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let bucket = futex_map_guard.get_mut(&key);
+            let bucket_mut = match bucket {
+                Some(bucket) => bucket,
+                None => {
+                    let bucket = FutexHashBucket::new();
+                    futex_map_guard.insert(key.clone(), bucket);
+                    futex_map_guard.get_mut(&key).unwrap()
+                }
+            };
+            bucket_mut.enqueue(futex_q.clone());
+
+            // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
+            if let Some(ref t) = timer {
+                t.activate();
+            }
+
+            drop(futex_map_guard);
+            break;
         }
-
-        drop(futex_map_guard);
         // 阻塞等待
         let wait_res = waiter.wait(true);
-
         // ========== 被唤醒后的检查 ==========
         // 进程被唤醒可能有以下几种情况：
         // 1. futex_wake 显式唤醒（正常情况）- futex_q 已从队列移除
@@ -523,7 +546,6 @@ impl Futex {
 
         // 从队列中唤醒
         let count = bucket_mut.wake_up(key.clone(), Some(bitset), effective_nr_wake)?;
-
         drop(binding);
 
         FutexData::try_remove(&key);

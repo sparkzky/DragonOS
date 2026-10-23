@@ -1995,14 +1995,19 @@ impl CompletelyFairScheduler {
         }
     }
 
-    pub fn set_next_task(rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
+    pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
         let mut se = next.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let cfs = se.cfs_rq();
             cfs.force_mut().set_next_entity(&se);
             (true, true)
         });
-        super::cfs_bandwidth::refresh_runtime_event(rq, &next);
+        // 此处不武装 runtime 耗尽事件（对齐 Linux：Linux 没有任何随切换
+        // 武装的 runtime 定时器，耗尽在 update_curr 计费点检查）。切换入口
+        // 无条件 arm(now+remaining) 会把 I/O 密集任务的每次唤醒（含被
+        // return_slack 钉在 RETAIN_NS 的地板余额）变成一个墙钟期限，实测
+        // 造成 2000+/s 的定时器武装风暴并饿死块提交管道。精确期限由
+        // SchedClass::tick 在真实计费之后的 refresh_runtime_event() 武装。
     }
 
     /// 寻找到最近公共组长
@@ -2228,40 +2233,9 @@ impl Scheduler for CompletelyFairScheduler {
             return None;
         }
 
-        let mut se;
-        loop {
-            let cfs = cfs_rq.unwrap();
-            let cfs = cfs.force_mut();
-            if cfs.throttled {
-                return None;
-            }
-            let curr = cfs.current();
-            let curr = if let Some(curr) = curr {
-                if curr.on_rq() {
-                    cfs.update_current();
-                    Some(curr)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            se = cfs.pick_next_entity_with_curr(curr.as_ref());
-            match se.clone() {
-                Some(val) => cfs_rq = val.my_cfs_rq.clone(),
-                None => {
-                    break;
-                }
-            }
-
-            if cfs_rq.is_none() {
-                break;
-            }
-        }
-
-        se.map(|se| se.pcb())
+        Self::pick_task_probe(rq)
     }
+
 
     fn tick(rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
         let mut se = pcb.sched_info().sched_entity();
@@ -2335,3 +2309,43 @@ impl Scheduler for CompletelyFairScheduler {
         });
     }
 }
+
+
+impl CompletelyFairScheduler {
+    fn pick_task_probe(rq: &mut CpuRunQueue) -> Option<Arc<ProcessControlBlock>> {
+        let mut cfs_rq = Some(rq.cfs_rq());
+        if cfs_rq.as_ref().unwrap().nr_running == 0 {
+            return None;
+        }
+        let mut se;
+        loop {
+            let cfs = cfs_rq.unwrap();
+            let cfs = cfs.force_mut();
+            if cfs.throttled {
+                return None;
+            }
+            let curr = cfs.current();
+            let curr = if let Some(curr) = curr {
+                if curr.on_rq() {
+                    cfs.update_current();
+                    Some(curr)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            se = cfs.pick_next_entity_with_curr(curr.as_ref());
+            match se.clone() {
+                Some(val) => cfs_rq = val.my_cfs_rq.clone(),
+                None => break,
+            }
+            if cfs_rq.is_none() {
+                break;
+            }
+        }
+        se.map(|se| se.pcb())
+    }
+}
+
+
