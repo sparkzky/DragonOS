@@ -210,6 +210,13 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 ---
 
+### 3.8 大镜像 load 楔死 / ext4 EIO（2026-10-23 新增证据）
+- 顺序对照（干净盘）：`kafka(335M)` → `mysql(162M)` 连续两次全新加载**均成功**（`L_KAFKA=0`、`L_MYSQL=0`），复跑第二轮（层已存在）亦成功 ⇒ **"第二张必挂"不成立**，楔死为间歇性。
+- 5 镜像连装（mysql→redis→zk→kafka→clickhouse）：前 4 个全部成功；**clickhouse 失败**，报错 `write /var/lib/docker/containerd/daemon/io.containerd.metadata.v1.bolt/meta.db: input/output error`，随后 writeback 持续 `flush_dirty_inodes: 元数据刷盘失败: EIO` / `sync_fs failed: EIO`；此时磁盘仍有 11G 空闲 ⇒ **非 ENOSPC，是 ext4/块层 EIO**。
+- 单独干净盘加载 clickhouse：**成功**（`L_CH=0`、`sync`=0，无 EIO）⇒ EIO 属**累积态/状态相关**，不是镜像内容问题。
+- 期间自动 `stall_watchdog` 抓到多次 `TASK DUMP`（62~64 任务）：dockerd/containerd 停在 `LSYSCALL=202`(futex)，`virtio_blk_io_0 Blocked(false)`、`page_reclaim`/`vfs_writeback`/`ext4_journal`/`ext4_evict` 全阻塞——IO 侧一过性停摆，多数可自恢复。
+- 待办：① 在 `complete_used_requests` 的 NotReady/EIO 与 `submit_bio` 失败点加一次性 critical（含 token/sector/op）定位 EIO 来源；② 若确认 virtio 队列复位丢完成，则按 #2515 的超时自检触发重试/重初始化。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
