@@ -1,13 +1,14 @@
 # DragonOS 运行 OCManager：问题现状与解决方案总览
 
-> 更新：2026-10-21 | 工作区：`~/DragonOS-ocmanager`（60+ 文件已 git add 未提交）
-> 流水账明细见 `fix-inventory-2026-10-18.md` 与 `assessment-2026-10-16.md`；本文是**重构后的可读总览**。
+> 更新：2026-10-23 | 工作区：`~/DragonOS-ocmanager`（**原子提交**，基线 `ea126290`，工作区干净）
+> 流水账明细见 `fix-inventory-2026-10-18.md`；PR 拆分与合入状态见 `pr-split-2026-10-23.md`；本文是**可读总览**。
 
 ---
 
 ## 0. 一句话现状
 
-**时钟子系统已修复并验证**；当前唯一卡点是一个**调度器缺陷：被唤醒的任务躺在运行队列里却长期不被调度执行**，它同时导致 mysql 容器楔死和 dockerd 全家卡死。嫌疑已收敛到 EEVDF 调度器对"正在运行任务"的 deadline 刷新语义，距最终修复预计一步之遥。
+**R15 调度饥饿与 R16 死锁均已修复并验证**（`docker load` 全程零 panic/spinout，BADHALT 洪泛消失），修复已拆为 9 个 PR（#2507-#2515）。**容器层已跑通 MySQL（`ready for connections` + SQL 查询）与 Redis（`PONG`）**。
+当前剩余阻断按优先级：① **大镜像 `docker load` 楔死**（cp-kafka 416MB，mysql/redis/zk 正常）；② **bash `<(函数)` 崩溃**（父 bash SIGSEGV，阻断官方 mysql entrypoint，已最小复现）；③ **负载期 kvm-clock 较 acpi_pm 慢 ~13%**（watchdog 实测）；④ `fault.rs:1206/1223` 关中断 shootdown（仅 pinpoint）；⑤ 容器崩溃后 `docker run` 挂起（2-e）。
 
 ---
 
@@ -64,7 +65,7 @@
 
 ---
 
-## 3. 当前唯一主诉：唤醒任务调度饥饿
+## 3. 主诉演进：R15 调度饥饿 → R16 死锁（均已闭环）
 
 ### 3.1 现象（三层同构）
 
@@ -200,23 +201,25 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 ---
 
-## 4. 独立待办（与主诉无依赖）
+## 4. 独立待办与当前阻断（2026-10-23）
 
-| 问题 | 状态 |
-|------|------|
-| storm 超脏 journal 重放 panic-park（嵌套 panic 守卫生效但重放未通过；浅脏盘已通过） | 待查重放路径 |
-| futex_wake `nr_wake=0` 强制唤醒 1 个（Linux 语义是 no-op） | 已发现待修 |
-| `is_kthread` 分类缺陷（WorkQueue worker 无 kthread 标记） | 已发现待修 |
-| `active_clocksource_regressed` 自旋窗 1s（注释写 1ms） | 已发现待修 |
-| IRQ 独立栈（Linux IST 语义，结构性） | 未动 |
-| 次级 syscall 缺口（AIO/fallocate/sysctl/ptrace/FAT/DAC） | 未动 |
+| 问题 | 状态/证据 |
+|------|-----------|
+| **大镜像 `docker load` 楔死** | cp-kafka 416MB tar load 中途盘零增长、Ctrl+C 无效；mysql/redis/zk 均 `LOAD=0`。与 2-e 同域，待 dockerd.log/任务转储或逐层加载定位 |
+| **bash `<(函数)` 崩溃** | 最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV；`f`、`(f)`、`$(f)`、`cat <(echo p;echo q)` 均正常；rip=0x65451（initialize_flags+0x71）、寄存器全零 |
+| **负载期时钟偏差** | watchdog：`cs=504ms` vs `wd=578ms`（kvm-clock 慢 ~13%），出现于 kafka load 期间；需用 PMTMR 交叉复测 |
+| **fault.rs:1206/1223 关中断 shootdown** | pinpoint 已取得；修法：gather 后延迟 flush / 原子区 fault 不发起同步 shootdown |
+| **容器崩溃后 `docker run` 挂起（2-e）** | docker logs/exec/inspect 挂起、dockerd 孤儿；与 load 楔死同源待查 |
+| storm 超脏 journal 重放 panic-park | 待查重放路径（本例多次复现：kill -9 后重放 park） |
+| futex_wake `nr_wake=0` 强制唤醒 1 个 | 已发现待修（Linux 语义 no-op） |
+| `is_kthread` 分类缺陷 | 已发现待修 |
+| `active_clocksource_regressed` 自旋窗 1s | 已发现待修 |
+| IRQ 独立栈（Linux IST） | 未动 |
+| 次级 syscall 缺口（AIO/fallocate/sysctl/ptrace/FAT/DAC） | AIO 已确认 mysqld 可回退；其余未动 |
 | QEMU >2G 且非 6G 启动挂死（D） | 未动，6G 绕过 |
-| Go 服务镜像构建与部署收尾（自启/hostfwd/文件分发） | 等内核收口 |
-| 大镜像 registry 拉取卡死 | 旁路 save/load |
+| Go 服务镜像构建与部署收尾 | 待 compose infra 打通后进行 |
 
----
-
-## 5. 调试工具资产（探针已编入内核，随修复保留）
+## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
 | 工具 | 位置 | 用途 |
 |------|------|------|
@@ -231,7 +234,9 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | place 探针 | fair.rs | 唤醒 vruntime 放置审计 |
 | futex_stress2 | guest /futex_stress2（主盘内置） | 双线程压测+STUCK 探测模式（wake-probe） |
 
-**操作提示**：压测命令首次发送常丢失，需重发一次；判定时钟速率必须用 uw 探针（串口缓冲有陈旧样本伪象）；传输盘写入会被 guest 页缓存覆盖，二进制注入用停机 debugfs 写主盘 p1 分区。
+> **2026-10-23 变更**：所有位于锁内/关中断区的 `print_critical!` 探针已删除（R16 定罪根因之一）；tmict/pvti/dlprobe 打印改为编译期开关（`TMICT_PRINT`/`DL_PROBE_PRINT=false`，需要诊断时改回 true）；tmict 采样基线已改 per-CPU 并扩展 PMTMR 24bit 回绕。保留：critical 输出通道、LSYSCALL/任务转储、apcal/aprecal。
+
+**操作提示**：guest 串口命令经常丢字符/需重发；长命令建议写成脚本注入磁盘后 `sh /xxx.sh` 执行；判定时钟速率用内核侧 PMTMR 交叉值（串口行计数会受突发写干扰）。
 
 ---
 
