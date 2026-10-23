@@ -105,7 +105,7 @@ impl<'fs, 'tx, 'core> MetadataIo<'fs, 'tx, 'core> {
         match self.transaction.as_deref() {
             Some(transaction) => {
                 let image = transaction.read(self.fs, id)?;
-                Ok(Block::new(id, Box::new(*image)))
+                Ok(image.to_owned_block(id)?)
             }
             None => self.fs.read_block(id),
         }

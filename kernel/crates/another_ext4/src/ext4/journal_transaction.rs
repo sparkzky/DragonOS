@@ -977,7 +977,7 @@ impl JournalTransactionCore {
         // Preserve bytes outside the 1024-byte superblock once, before the
         // first write. Neither active nor clean tail updates may allocate a
         // block by calling read_block after the journal becomes active.
-        let mut active_sb_block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| CommitError {
+        let mut active_sb_block = Self::heap_zero_block().map_err(|_| CommitError {
             error: Ext4Error::new(ErrCode::ENOMEM),
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
@@ -1074,6 +1074,23 @@ impl JournalTransactionCore {
     }
 }
 
+impl JournalTransactionCore {
+    /// 在堆上构造零填充块缓冲。
+    ///
+    /// `Box::try_new([0; BLOCK_SIZE])` 会先在内核栈物化 4KB 数组再拷贝；
+    /// 挂载/日志重放的深层调用链叠加这样的帧曾写穿 32KB 内核栈。Linux
+    /// 的块缓冲同样不驻留内核栈。
+    fn heap_zero_block() -> Result<Box<[u8; BLOCK_SIZE]>> {
+        let mut v: Vec<u8> = Vec::new();
+        v.try_reserve_exact(BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        v.resize(BLOCK_SIZE, 0);
+        v.into_boxed_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))
+    }
+}
+
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         self.release_writer();
@@ -1083,6 +1100,25 @@ impl Drop for Transaction<'_> {
 pub enum BlockView<'a> {
     Staged(&'a [u8; BLOCK_SIZE]),
     Device(Block),
+}
+
+impl BlockView<'_> {
+    /// 堆上深拷贝为独立 Block。
+        ///
+        /// 等价于 `Block::new(home, Box::new(**self))`，但不在内核栈上
+        /// 物化 4KB 临时数组——挂载/日志重放调用链叠加那样的帧曾写穿
+        /// 32KB 内核栈。
+    pub(super) fn to_owned_block(&self, home: PBlockId) -> Result<Block> {
+        let mut v: Vec<u8> = Vec::new();
+        v.try_reserve_exact(BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        v.extend_from_slice(&self[..]);
+        let b: Box<[u8; BLOCK_SIZE]> = v
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        Ok(Block::new(home, b))
+    }
 }
 
 impl core::ops::Deref for BlockView<'_> {

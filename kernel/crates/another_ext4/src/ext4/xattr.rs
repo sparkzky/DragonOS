@@ -297,7 +297,7 @@ impl Ext4 {
             if ea_inode {
                 return Err(Ext4Error::new(ErrCode::ENOTSUP));
             }
-            let block = XattrBlock::new(Block::new(old_home, Box::new(*image)));
+            let block = XattrBlock::new(image.to_owned_block(old_home)?);
             self.verify_xattr_block_checksum(old_home, &block)?;
             (block, header.refcount() > 1)
         };

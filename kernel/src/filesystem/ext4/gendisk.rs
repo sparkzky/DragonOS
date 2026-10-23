@@ -116,7 +116,14 @@ impl another_ext4::BlockDevice for GenDisk {
         &self,
         block_id: u64,
     ) -> core::result::Result<another_ext4::Block, another_ext4::Ext4Error> {
-        let mut buf = Box::try_new([0u8; another_ext4::BLOCK_SIZE])
+        // 块缓冲直接在堆上构造：`Box::try_new([0u8; N])` 会先在内核栈上
+        // 物化 N 字节数组再拷贝。ext4 挂载/日志重放的读取调用链有多层
+        // 这样的帧叠加（mount→load→journal→extent 下降），32KB 内核栈曾被
+        // 写穿（栈底 PCB 槽被污染）。Linux 的块缓冲同样不驻留内核栈。
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; another_ext4::BLOCK_SIZE];
+        let mut buf: alloc::boxed::Box<[u8; another_ext4::BLOCK_SIZE]> = buf
+            .into_boxed_slice()
+            .try_into()
             .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::ENOMEM))?;
 
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
@@ -175,10 +182,20 @@ impl another_ext4::BlockDevice for GenDisk {
         &self,
         block: &another_ext4::Block,
     ) -> core::result::Result<(), another_ext4::Ext4Error> {
-        let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
+        // 与 read_blocks/write_blocks 一致的边界校验：单块写入同样必须
+        // 落在设备范围内。journal 重放的 write_home 目标块号取自盘上
+        // 日志内容（parse_tags 已拒绝 >= filesystem_blocks 的目标），此处
+        // 再按设备 LBA 范围兜底，防止任何未预期调用链把脏块号变成越界 IO。
+        let (lba_start, lba_count) = self
+            .checked_ext4_range(block.id, 1)
+            .map_err(|error| another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error)))?;
+        let expected = another_ext4::BLOCK_SIZE;
+        if block.data.len() != expected {
+            return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EINVAL));
+        }
         let completed = self
             .block_device()
-            .and_then(|bdev| bdev.write_at(lba_id_start, block_count, &*block.data))
+            .and_then(|bdev| bdev.write_at(lba_start, lba_count, &*block.data))
             .map_err(|e| {
                 let code = Self::map_system_error_to_ext4(&e);
                 if code == another_ext4::ErrCode::EROFS {

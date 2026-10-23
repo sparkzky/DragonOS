@@ -230,8 +230,9 @@ impl Ext4 {
             .start_pblock()
             .checked_add(u64::from(logical - extent.start_lblock()))
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-        self.block_device
-            .write_block(&Block::new(home, Box::new(*image)))?;
+        self.block_device.write_block(
+            &super::journal_transaction::BlockView::Staged(image).to_owned_block(home)?,
+        )?;
         // An error cannot undo payload bytes. The caller must not publish SIZE
         // on error; no metadata/bitmap publication occurred in this operation.
         self.block_device.flush()?;

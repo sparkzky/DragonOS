@@ -417,8 +417,17 @@ impl JournalBatchCore {
         home: PBlockId,
     ) -> Result<Block> {
         self.validate_home(home)?;
-        let mut image =
-            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        // 块缓冲在堆上构造：栈上物化 4KB 数组会在挂载/重放的深层调用链
+        // 中叠加写穿 32KB 内核栈（Linux 的块缓冲不驻留内核栈）。
+        let mut image_vec: Vec<u8> = Vec::new();
+        image_vec
+            .try_reserve_exact(BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        image_vec.resize(BLOCK_SIZE, 0);
+        let mut image: Box<[u8; BLOCK_SIZE]> = image_vec
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
         loop {
             let generation = {
                 let state = self.state.lock();
