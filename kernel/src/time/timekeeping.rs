@@ -249,33 +249,31 @@ fn clocksource_delta(
         return Err(SystemError::EINVAL);
     }
     let raw = cycle_now.wrapping_sub(cycle_last) & mask;
-    // 单调时钟源的读数不允许回退。跨 CPU 读取同一时钟源时（如 kvm-clock
-    // 的 per-CPU pvclock 值、未经同步校准的 TSC），一次回退读数会经
-    // wrapping_sub 变成 ~2^mask 的“巨大前跳”，再被 max_cycles 封顶成
-    // 数小时的前向跳变，足以毒化 tick 的绝对期限。回退样本按 0 elapsed
-    // 处理，随下一次 forward()/正常读数自然恢复。Linux 通过 TSC 同步
-    // 校验（check_tsc_sync_source）与 KVM master clock 从构造上保证单调，
-    // 这里在换算入口强制同一不变式。
-    if raw > mask >> 1 {
-        // 持续性倒置升级：偶发倒置按 0 处理即可自愈；但若时钟源在持续
-        // 倒走（如 KVM 负载下 pvclock 回退），永久钳 0 会把单调钟冻死。
-        // 每 64 次倒置唤醒一次 clocksource watchdog kthread——它会做活跃
-        // 源倒走自检（active_clocksource_regressed），标记 unstable 并
-        // 重选健康源（对齐 Linux clocksource watchdog 语义）。
+    // 窄掩码时钟源（如 acpi_pm 的 24 位 PMTMR，窗口仅 2^24/3.579545MHz ≈ 4.69s）
+    // 无法用「超过半掩码即倒退」来判方向：任何超过 ~2.34s 的合法前向间隔
+    // （中断关闭、长时间停摆、负载抖动）都会被误判为回退并钳成 0，使单调钟
+    // 冻结数秒、deadline tick 反复 re-anchor。对齐 Linux 6.6
+    // timekeeping_get_delta()：不做方向推断，统一按 max_cycles 封顶。
+    // max_cycles = min(u64::MAX / max_mult, mask)，因此即便读数真回退，
+    // 产生的前向跳变也被限制在该时钟源的换算窗口内（秒级），不会毒化
+    // tick 的绝对期限；真正的持续倒走由 active_clocksource_regressed()
+    // 的 watchdog 自检负责标记 unstable 并重选。
+    if raw > max_cycles {
+        // 持续性倒置/超窗升级：偶发一次按 max_cycles 自愈；若时钟源在
+        // 持续倒走（如 KVM 负载下 pvclock 回退），每 64 次唤醒一次
+        // clocksource watchdog kthread 做活跃源倒走自检并重选健康源。
         if INVERTED_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 4096 == 0 {
             crate::print_critical!(
-                "invdet: now={} last={} raw={:#x} mask={:#x} max={:#x}\n",
+                "invdet: now={} last={} raw={} max={}\n",
                 cycle_now,
                 cycle_last,
                 raw,
-                mask,
                 max_cycles
             );
         }
         if INVERTED_READS.load(core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
             crate::time::clocksource::run_watchdog_kthread();
         }
-        return Ok(0);
     }
     // Match Linux timekeeping_get_delta(): a delayed update beyond the
     // conversion-safe window is capped, not allowed to overflow and not
