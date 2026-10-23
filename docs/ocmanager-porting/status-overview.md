@@ -279,6 +279,16 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 导出 `/home/sparkzky/ocm-tars/ocservices.tar.gz`（139MB，三镜像合一）。
 - 部署脚本 `r16_ocm_up.sh`：`--network host` 起 mdb/rds/ch/kfk + footstone（env 走 `config/env.example` 语义），先探活 CH/Redis/Kafka，再 `docker logs foot`。
 
+### 3.16 Go 服务部署进展（2026-10-23 深夜，12G，seed 盘零 load）
+- 环境：`--network host` 起 mdb / rds / ch / kfk，然后 `oc-footstone:dev`。
+- 结果：
+  - MySQL ✅（`--initialize-insecure` 只建 `root@localhost`；必须补 `CREATE USER 'root'@'%'` + `GRANT ALL ON *.* TO 'root'@'%'`，否则 footstone 报 `Error 1130 Host '127.0.0.1' is not allowed`）
+  - Redis ✅（`PONG`）
+  - Kafka ✅（容器 Up；`SYS_MEMBARRIER` 未实现但 redis 仍正常）
+  - **ClickHouse ❌ `Exited (139)`（SIGSEGV）**，日志只到 jemalloc `Number of CPUs detected is not deterministic`，内核侧无 fault 记录
+  - footstone：入口脚本渲染配置成功、MySQL 连接走通，随后因 `dial tcp 127.0.0.1:9000: connect: connection refused`（CK 未起）退出
+- 新缺陷：ClickHouse server 在 DragonOS 上启动即 SIGSEGV，需单独定位（优先查 CPU 探测相关 syscall：`sched_getaffinity`/`sysconf`、`madvise`、`rseq` 或 `getrandom`）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
