@@ -299,6 +299,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
   - `readarray -t A < <(clickhouse extract-from-config …)` → `N=1`
 - 判定：**bash 子进程在多次 command/process substitution 后上下文损坏**（fork/子进程返回路径），不是 ClickHouse 自身缺陷。待办：在最小脚本（重复 N 次 `readarray … < <(true)`）上二分出触发次数，再查 `fork`/`clone` 返回时 TrapFrame 与寄存器恢复路径。
 
+### 3.18 关机清理 journal（2026-10-23，已修复并实测）
+- 现象：`busybox poweroff -f` 前即使 `sync`，rw 挂载的 ext4 仍保留未提交 journal；下次启动 `dirty journal detected ... replaying` 偶发 **nested-panic park**（重放与并发打印/状态不一致），导致镜像盘不可复用。
+- 根因：`kernel_power_off()` 只做 notifier + `device_shutdown()`，缺少 Linux 语义的 `sync` + `remount-ro`（`mount -o remount,ro /` 在 DragonOS 上返回 `Not supported`，RM=255）。
+- 修复：新增 `vfs::mount::shutdown_mounted_filesystems()`（`git 8d93771f`）——对每个可写挂载执行 `sync_fs(wait)` 后调用 `FileSystem::on_umount()`；ext4 的 `on_umount` 已是 `flush_dirty_inodes + journal.shutdown + shutdown_writable()`（清 RECOVER）。在 `kernel_shutdown_prepare()` 中 `device_shutdown()` 之前调用。
+- 实测（#196 / 12G / seed 盘）：启动 → `dragon-docker-start` → `docker run redis` → `busybox poweroff -f` → 再次启动 **无 `dirty journal detected`**，`docker images` 仍为 8 个镜像。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
