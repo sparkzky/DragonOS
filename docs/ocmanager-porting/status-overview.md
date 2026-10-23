@@ -194,7 +194,8 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 所有容器操作都在净盘 + 注入 tar（`/mysql8035.tar.gz`、`/redis72.tar.gz`）后进行；`docker load` 全程无挂死。
 - 官方 mysql entrypoint 仍被 bash `<(...)`+函数缺陷阻断（最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV），迁移暂用直接 `mysqld` 启动。
 
-- **时钟偏差复现（补充）**
+- **时钟速率实测（2026-10-23，推翻“慢钟”结论）**：guest `date +%s` 在宿主 148s 真实时间内前进 147s（**99.3%**），kvm-clock 速率准确。watchdog 的 `cs=504000000` 恒定 vs `wd=577~784ms` 波动，说明**参考侧（acpi_pm → ns 换算或读取）有偏差**（784/504≈1.555），且未触发 unstable/重选（日志无 reselection）。属诊断路径缺陷，不是运行时钟问题；需复核 acpi_pm 的 `mult/shift`（`clocks_calc_mult_shift`）与 `clocksource_cyc2ns`。
+- **旧观察（已作废）**
 - **时钟偏差复现（重要）**：多次 watchdog 输出呈 `cs=504000000` vs `wd=577~784ms`（kvm-clock 相对 acpi_pm 慢 13%~36%），且与负载无关（空闲时也出现）。这说明 kvm-clock **速率本身**在 DragonOS 上不稳定，需按 R9-R13 的方法复测（PMTMR 交叉 + 是否触发自贬/切换 acpi_pm）。此前"100.1% 速率"结论只在特定窗口成立。
 此前（上一轮）的观察：：kafka load 进行时 clocksource watchdog 报 `cs_dev_nsec=504000000` vs `wd_dev_nsec=577876797`——kvm-clock 相对 acpi_pm 慢约 13%。此前的“时钟健康”结论基于无故障时的采样；高 IO 负载下存在真实速率偏差，需复查（与 R16SRC 探针结论不矛盾：当时采样的窗口无偏差）。
 - **大镜像 load 楔死**：mysql(162MB tar)/redis/zk 均 LOAD=0；cp-kafka(416MB tar) 卡死。下一步方向：① 用 `/tmp/dockerd.log` 与任务转储定位（需可交互 guest）；② 分块加载该镜像层（逐层 `docker load`）；③ 检查是否与 overlayfs/快照解包路径相关。
