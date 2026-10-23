@@ -652,3 +652,71 @@ ROOTFS_MANIFEST=docker SKIP_GRUB=1 make write_diskimage
 ## 附录 B：为什么不是“把 tar 打进盘里让 docker import/load 更快”
 
 `docker load` 的耗时由三部分组成（guest 实测现象）：读取 1.27 GiB tar、把 2.90 GiB 唯一 layer 写入 ext4、解包成 3.0 GiB snapshots。把 tar 换成 `docker import` 只是去掉 layer 结构，写入量不变；而 golden/seed 直接跳过全部三步。因此本方案的核心不是“换导入命令”，而是**把结果持久化**。
+
+---
+
+## 11. 落地实测（2026-10-23，A2 已跑通）
+
+### 11.1 产物
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `/home/sparkzky/ocm-tars/var-lib-docker-seed.tar.zst` | 2.3 GiB（解压后 5.9 GiB） | guest 内 `docker load` 完 6 个 tar 后的 `/var/lib/docker` |
+| `/home/sparkzky/ocm-tars/var-lib-docker-seed.sha256` | — | `ae0b9086cb970f04e3a5c15c240aa5549019e146e4222dc6ea69b363028c2774` |
+| 含 seed 的工作盘 | 7.9 GiB / 16 GiB | `bin/disk-image-x86_64.img`（已注入，可直接用） |
+
+seed 内含 8 个镜像：mysql:8.0.35、redis:7.2.3-alpine、bitnamilegacy/zookeeper:3.8.3、bitnamilegacy/kafka:3.5.1、clickhouse/clickhouse-server:23.8.8.20、oc-footstone:dev、oc-msg-etl:dev、oc-sysdiagnose:dev。
+
+### 11.2 生成与注入（命令级，均实测）
+
+```bash
+# 1) 生成：12G 内存引导（8G 在第 5 张镜像 load 时 alloc-exhausted）
+#    guest: sh /r16_load_all.sh   → 6 个 L_*=0 + SYNC=0 + LD_END
+#    guest: sync; busybox poweroff -f
+
+# 2) 抽取（host，root）
+LOOP=$(sudo losetup -fP --show bin/disk-image-x86_64.img)
+sudo mount -o ro,noload ${LOOP}p1 /mnt/ocm-seed
+sudo tar -C /mnt/ocm-seed/var/lib/docker --numeric-owner --xattrs --xattrs-include='*' \
+  --exclude=./containerd/daemon/tmpmounts \
+  --exclude=./containerd/daemon/io.containerd.grpc.v1.introspection \
+  -cf - . | zstd -T0 -3 -o ~/ocm-tars/var-lib-docker-seed.tar.zst
+sudo umount /mnt/ocm-seed; sudo losetup -d $LOOP
+
+# 3) 注入新盘（host，root）：写盘后
+LOOP=$(sudo losetup -fP --show bin/disk-image-x86_64.img)
+sudo mount ${LOOP}p1 /mnt/ocm-inject
+sudo mkdir -p /mnt/ocm-inject/var/lib/docker && sudo chmod 0710 /mnt/ocm-inject/var/lib/docker
+zstd -dc ~/ocm-tars/var-lib-docker-seed.tar.zst | sudo tar -x -C /mnt/ocm-inject/var/lib/docker \
+  --numeric-owner --xattrs --xattrs-include='*'
+sudo sync && sudo umount /mnt/ocm-inject && sudo losetup -d $LOOP
+```
+
+耗时（实测）：抽取打包 13s；注入解包 53s；合计 < 1.5 分钟，对比 guest 内 6 次 `docker load` 约 **50 分钟**。
+
+### 11.3 验收（实测，12G 引导）
+
+```
+root@dragonos:~# dragon-docker-start; docker images
+29.1.3 overlayfs
+IMAGE
+bitnamilegacy/kafka:3.5.1
+bitnamilegacy/zookeeper:3.8.3
+clickhouse/clickhouse-server:23.8.8.20
+mysql:8.0.35
+oc-footstone:dev
+oc-msg-etl:dev
+oc-sysdiagnose:dev
+redis:7.2.3-alpine
+
+root@dragonos:~# docker run -d --name rds redis:7.2.3-alpine; docker exec rds redis-cli ping
+PONG
+```
+
+**结论：零 `docker load`，启动后即可 `docker run`。**
+
+### 11.4 已知限制与后续
+
+- 本次运行 `docker run` 期间仍出现一次可自恢复的 `TASK DUMP: kernel stall detected`（与既有 IO/调度抖动同域），未影响 `PONG`。
+- 12G 内存是本次全量 load 的实测下限；若后续只注入 seed（不 load），8G 亦可运行，但仍建议 ≥10G 以免容器启动期 `alloc-exhausted`。
+- 接入构建流程（`write_disk_image.sh` 注入 seed + qcow2 覆盖盘）尚未提交，按 §6.1 的补丁即可接入。
