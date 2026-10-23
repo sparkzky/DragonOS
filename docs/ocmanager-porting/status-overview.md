@@ -289,6 +289,16 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
   - footstone：入口脚本渲染配置成功、MySQL 连接走通，随后因 `dial tcp 127.0.0.1:9000: connect: connection refused`（CK 未起）退出
 - 新缺陷：ClickHouse server 在 DragonOS 上启动即 SIGSEGV，需单独定位（优先查 CPU 探测相关 syscall：`sched_getaffinity`/`sysconf`、`madvise`、`rseq` 或 `getrandom`）。
 
+### 3.17 ClickHouse SIGSEGV 归因（2026-10-23）
+- 现象：`docker run clickhouse/clickhouse-server:23.8.8.20` → `Exited (139)`；`clickhouse-server --version` 正常（CHV=0）。
+- `bash -x /entrypoint.sh` 定位：崩溃发生在第二次 `readarray -t DISKS_METADATA_PATHS < <(clickhouse extract-from-config …)` 之后 / `mkdir -p /var/lib/clickhouse/` 处，内核日志：
+  `pid: NNNN (bash) No mapped vma ... rip:0x67ca1, address: 0x8, rax/rdi/rsi/rdx=0, rsp=0x6ffff09ff098`
+  → 与 rootfs bash 早前 `<(...)` 崩溃**同一特征**（`mov 0x8(%rdi)`、rdi=NULL、rsp 呈异常高位），但容器内简单用例均通过：
+  - `echo "$(id -u) $(id -g)"` → `0 0`
+  - `readarray -t X < <(seq 3)` → `2`
+  - `readarray -t A < <(clickhouse extract-from-config …)` → `N=1`
+- 判定：**bash 子进程在多次 command/process substitution 后上下文损坏**（fork/子进程返回路径），不是 ClickHouse 自身缺陷。待办：在最小脚本（重复 N 次 `readarray … < <(true)`）上二分出触发次数，再查 `fork`/`clone` 返回时 TrapFrame 与寄存器恢复路径。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
