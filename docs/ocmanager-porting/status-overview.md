@@ -353,6 +353,17 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 已核对并排除：`copy_thread` 正确复制父 TrapFrame 并清零 rax；syscall 入口帧布局与 `ret_from_intr`/`iretq` 一致；`CLONE_VFORK` 已实现父进程阻塞（`do_clone` 中 `wait_for_completion_killable`，exit/exec 时 complete）。
 - 下一步（需内核探针）：在子进程首次返回用户态前按 pid 采样一次 TrapFrame 的 rip/rsp/rdi/rsi/rdx，与 fork 时父帧对比；同时记录 `%fs` base（0x67ca1 附近使用 `%fs:0x28` 栈金丝雀，若 FS base=0 则读地址 0x28）。
 
+### 3.20 bash 子进程崩溃：复现缩小（2026-10-24 补测）
+- bind mount 可用（`-v /guesttest:/t` → `HELLO`），据此把镜像内 `/entrypoint.sh` 复制到 guest 做二分。
+- 取前 41 行（到第二次 `readarray … < <(clickhouse … || true)`）运行：**子壳 bash 触发 `No mapped vma`（rip=0x67ca1, addr=0x8, 全零寄存器）但父脚本继续执行并打印 `OK41`，退出码 0**。说明崩溃的是命令替换/进程替换产生的子 shell，父 shell 可存活。
+- 对照：
+  - `readarray -t A < <(false || true)` → `N=0`，无崩溃；
+  - 300 次 `readarray -t A < <(true || true)` → `LOOPOK`，无崩溃；
+  - 预建 `/var/lib/clickhouse` 后跑完整 entrypoint → 仍崩溃（排除 `mkdir -p`）。
+  - 简单信号帧验证：`trap "echo HANDLED" SEGV; kill -SEGV $$` → `HANDLED` / `after`，基础信号投递正常。
+- 结论（推断）：触发条件依赖 `clickhouse extract-from-config` 子进程（jemalloc/mmap 重负载）与进程替换的时序；日志中的全零寄存器很可能是**二次故障**（SIGSEGV 处理/重试路径）的帧，首个故障未被现有日志捕获。
+- 下一步：① 在 `setup_frame()` 与 `sys_rt_sigreturn()` 各加一次性采样（sig、frame.rip/rsp/rdi、ucontext 读回值），判断是投递还是恢复阶段被清零；② 或在 user #PF 入口加 per-pid 环形缓冲（记录首个故障的 rip/addr/regs），崩溃后再打印。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
