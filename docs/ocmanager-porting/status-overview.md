@@ -551,6 +551,11 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 ```
 
 - 结论：形态是 panic/格式化栈帧，且对象从未被 drop → 该堆页被内核栈/格式化路径复用后覆盖。
+- 对照实验：用 `KERNEL_FEATURES=kstack_protect make kernel`（内核栈 + guard page，栈占用翻倍）启动同一脏 journal：
+  **2/2 次正常完成重放并进入控制台**，未再出现 `SOFTIRQ CORRUPT`；而无保护内核 3/3 次 panic。
+  说明该崩溃与内核栈内存布局强相关（guard page 改变布局后不再踩到对象），后续应以内核栈溢出/越界为根因方向继续收敛。
+  启用该特性后新增告警：`tlb: N shootdown(s) initiated with interrupts disabled ... kstack.rs:42`
+  （guard 映射的 TLB flush 在关中断上下文发起），若要默认启用该特性需先改为延迟 flush。
 - 下一步：为内核栈加 guard page 与溢出检测并记录溢出者（与「IRQ 独立栈」合并处理），再验证脏 journal 场景。
 - 旁证：同一窗口 clocksource watchdog 报 `kvm-clock` 与 `acpi_pm` 相差 ~0.8s 并 `forcing reselection`，时间回退可能放大该路径的时序敏感性。
 
