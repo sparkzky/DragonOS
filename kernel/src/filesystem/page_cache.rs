@@ -997,7 +997,31 @@ impl PageIoWaiter {
     }
 
     pub fn wait(&self) -> Result<usize, SystemError> {
-        self.completion.wait_for_completion()?;
+        // 诊断：无超时等待会让完成链丢失表现为“双 CPU idle 的静默挂死”。
+        // 改为 1s 分片等待，持续超时则打印一次，便于判定是页缓存读批未完成。
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static WAIT_STALLS: AtomicU64 = AtomicU64::new(0);
+            loop {
+                match self
+                    .completion
+                    .wait_for_completion_timeout(crate::time::clocksource::HZ as i64)
+                {
+                    Ok(0) => {
+                        let n = WAIT_STALLS.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 {
+                            crate::print_critical!(
+                                "pcache stall: read-batch wait exceeded {}s (pid={})\n",
+                                n + 1,
+                                crate::process::ProcessManager::current_pid().data()
+                            );
+                        }
+                    }
+                    Ok(_) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         match self.state.lock_irqsave().result.as_ref() {
             Some(Ok(len)) => Ok(*len),
             Some(Err(e)) => Err(e.clone()),
@@ -2147,11 +2171,33 @@ impl PageEntry {
     }
 
     fn wait_ready(&self) -> Result<Arc<Page>, SystemError> {
-        self.wait_queue.wait_until(|| match self.state() {
-            PageState::Loading => None,
-            PageState::Error => Some(Err(SystemError::EIO)),
-            _ => Some(Ok(self.page.clone())),
-        })
+        // 诊断：原始实现是无超时的不可中断等待；一旦 Loading 页的完成链丢失，
+        // 表现为“双 CPU idle 的静默挂死”。这里改为 1s 分片等待并周期性打印，
+        // 语义不变（循环直到状态离开 Loading）。
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static STALLS: AtomicU64 = AtomicU64::new(0);
+        loop {
+            match self.wait_queue.wait_until_timeout(
+                || match self.state() {
+                    PageState::Loading => None,
+                    PageState::Error => Some(Err(SystemError::EIO)),
+                    _ => Some(Ok(self.page.clone())),
+                },
+                crate::time::Duration::from_secs(1),
+            ) {
+                Ok(result) => return result,
+                Err(_) => {
+                    let n = STALLS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        crate::print_critical!(
+                            "pcache stall: wait_ready Loading exceeded {}s (pid={})\n",
+                            n + 1,
+                            crate::process::ProcessManager::current_pid().data()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn decode_state(value: u8) -> PageState {
