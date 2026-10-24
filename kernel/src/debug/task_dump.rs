@@ -168,9 +168,13 @@ pub(crate) fn dump_all_tasks() {
     );
     for pcb in procs.iter() {
         let state = pcb.sched_info().state();
+        // 打印 tgid：exec 的 group-exec 等待需要兄弟线程退出，按 tgid 分组
+        // 可直接看出哪个进程组卡住。
+        let tgid = pcb.task_tgid_vnr().map(|p| p.data()).unwrap_or(0);
         println_critical!(
-            "[pid {:>6}] {:<16} state={:?}",
+            "[pid {:>6}] tgid {:>6} {:<16} state={:?}",
             pcb.raw_pid().data(),
+            tgid,
             pcb.basic().name(),
             state
         );
