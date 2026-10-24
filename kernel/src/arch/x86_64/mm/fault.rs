@@ -560,28 +560,10 @@ impl X86_64MMArch {
                         // 用户态 #PF 的 TrapFrame 没有原 syscall 号（errcode 是
                         // 硬件错误码），因此把 rax/rdi/rsi/rdx 一并打印——它们
                         // 通常仍是该 syscall 的号与入参，足以判断崩在哪次调用。
-                        // 临时诊断：验证 rip 是否可信——读取 rip 处 8 字节指令，
-                        // 并输出 cs/ss/rflags，便于判断 trap frame 是否错乱。
-                        let insn = crate::syscall::user_access::UserBufferReader::new(
-                            regs.rip as *const u8,
-                            8,
-                            true,
-                        )
-                        .and_then(|reader| reader.read_one_from_user::<[u8; 8]>(0))
-                        .map(|bytes| bytes)
-                        .ok();
-                        // 临时诊断：bash PIE 基址实测为 0x10000，bgpids 全局在 0x122f50。
-                        // 读取其 storage(0..8)/nalloc/... 以确认是否未初始化。
-                        let bgpids = crate::syscall::user_access::UserBufferReader::new(
-                            0x122f50 as *const u8,
-                            32,
-                            true,
-                        )
-                        .and_then(|reader| reader.read_one_from_user::<[u8; 32]>(0))
-                        .map(|b| b)
-                        .ok();
+                        // 注意：此处仍持有地址空间写锁，绝不能读取用户内存
+                        // （读取会产生嵌套缺页并自死锁）。
                         log::error!(
-                            "pid: {} ({}) No mapped vma, error_code: {:?}, rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, cs:{:#x}, ss:{:#x}, rflags:{:#x}, insn:{:02x?}, flags: {:?}",
+                            "pid: {} ({}) No mapped vma, error_code: {:?}, rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, cs:{:#x}, ss:{:#x}, rflags:{:#x}, flags: {:?}",
                             ProcessManager::current_pid().data(),
                             ProcessManager::current_pcb().basic().name(),
                             error_code,
@@ -595,19 +577,8 @@ impl X86_64MMArch {
                             regs.cs,
                             regs.ss,
                             regs.rflags,
-                            insn,
                             flags
                         );
-                        if let Some(b) = bgpids {
-                            log::error!(
-                                "bgpids@0x122f50: storage={:#x} nalloc={} head={} npid={} raw={:02x?}",
-                                u64::from_le_bytes(b[0..8].try_into().unwrap()),
-                                u32::from_le_bytes(b[8..12].try_into().unwrap()),
-                                u32::from_le_bytes(b[12..16].try_into().unwrap()),
-                                u32::from_le_bytes(b[16..20].try_into().unwrap()),
-                                b
-                            );
-                        }
 
                         send_segv_maperr();
                         return;
