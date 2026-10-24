@@ -795,7 +795,7 @@ CPU1: 关中断 → 调 flush_tlb_kernel_range_inner → 阻塞在 FLUSH_TLB_GLO
 即：**两个 IRQ-off 发起者互等对方的 IPI 应答**。这是通用缺陷（`flush_tlb_kernel_range`
 在关中断路径都会被调用），guard page 只是把频次放大到必现。
 
-### 3.46.2 修复方向（未实施）
+### 3.46.2 修复思路（分析）
 
 1. **关中断上下文禁止同步 shootdown**：`flush_tlb_kernel_range` 在 IF=0 时只做本地
    `invlpg`，把区间挂到 per-CPU pending 队列，在安全点（IRQ 开启、返回用户、idle）
@@ -805,13 +805,61 @@ CPU1: 关中断 → 调 flush_tlb_kernel_range_inner → 阻塞在 FLUSH_TLB_GLO
 3. 也可参考 per-initiator CSD 池消除全局锁，但**单独去掉锁不能解决互等**（两个
    IRQ-off 发起者仍会互等），必须先解决第 1 条。
 
+### 3.46.3 修复与验证（`99663970`）
+
+`flush_tlb_kernel_range_inner` / `flush_tlb_mm_range` 取全局锁改为
+`acquire_flush_tlb_lock()`：自旋等待时调用 `service_pending_inbound_flush()`，
+按 IPI handler 的同一流程就地执行 `local_flush_tlb_func` 并置 `done`；ack 轮询循环
+中每 1024 次也服务一次。就地服务会把 CSD 的 `info` 指针 `take()` 置空，避免迟到的
+IPI 解引用已失效的发起者栈帧（UAF）。
+
+验证（`KERNEL_FEATURES=kstack_protect`，内核 #261）：
+
+| 步骤 | 修复前 | 修复后 |
+|---|---|---|
+| `dragon-docker-start`（第二次） | 卡死 >3 分钟（CPU0 轮询 ack、CPU1 自旋在 flush 锁） | 正常拉起，`docker version` 显示 Server 29.1.3 |
+| 容器运行 | 未到该步 | `docker run ... echo guard_ok` 输出 `guard_ok` |
+| `docker commit` | 未到该步 | 成功（RC=0） |
+
+默认内核（#262，未开 guard）净盘回归：7 容器 Up，footstone/msg-etl/sysdiagnose
+健康检查全 200，`mysqld is alive`，迁移全部 RC=0，`poweroff -f` 后 QEMU exit 0。
+
 结论：
 
-1. `kstack_protect` **不改为默认开启**，保持 `kernel/Cargo.toml` 中默认关闭；
-2. 之前“guard page 下 2/2 正常”只覆盖启动路径，不覆盖容器负载，本结论修正该记录；
-3. 后续修复方向：shootdown 请求合并（per-CPU pending mask 和 ack 计数必须原子配对），
-   或在 guard 映射 flush 时复用已有的“延迟 shootdown + 统一 flush”通道，禁止在
-   IPI 处理上下文中再次发起内核范围 shootdown。
+1. `kstack_protect` **仍不改为默认开启**：修复解决了已观测的 flush 锁互等，但
+   guard 特性下的**全栈**（`/up_ocm.sh` 七个容器）尚未跑通（一次运行在 15 分钟内
+   未到 `UP_END`，且两 CPU 均处于 idle，原因未定位；可能与脚本重复调用
+   `dragon-docker-start` 有关）。下一步：在干净 guard 内核上、不预先手动启动
+   dockerd，重跑 `/up_ocm.sh` 并定位该次停滞；
+2. 之前“guard page 下 2/2 正常”只覆盖启动路径，本结论修正该记录。
+
+## 3.47 `CURRENT_PCB_DIAG` 首次读取成功（2026-10-25）
+
+在 12G + 脏 journal（脚本执行中 `SIGKILL` 后重启）复现了 `SOFTIRQ CORRUPT` +
+`Kernel code ... illegally accessed user address` 的旧故障；因 §3.43.4 的去递归改造，
+DIAG 已能读到：
+
+```
+CURRENT_PCB_DIAG = [base=0xffff800340208000, slot=0xffff800340208500,
+                    owner_pid=0(未找到), kind=0, rsp=0xffff80034020f720,
+                    magic=0x5a5a5a5a]
+```
+
+分析：
+
+- `slot == base + 0x500`，**与 4G 样本的 `0xffff800140208500` 签名完全一致**
+  （同样是 base+0x500），说明这是确定性的数据内容，而非随机越界；
+- `find_task_by_stack_base()` 在 kernel_stack 与 syscall_stack 中都没有这个 base →
+  出错瞬间的 `rsp` **不在任何已登记任务栈上**；
+- 该 32K 窗口的内容是一组指向同窗口内 `0x200` 间隔地址的指针
+  （`0x...207000/07200/07400/...`），不像栈帧；相邻区域紧挨 softirq box
+  （`0xffff800340213000`）；
+- 两个 CPU 最终都停在 `rust_begin_unwind`，CPU0 的 rsp 与该窗口一致。
+
+结论：`current_pcb()` 是在一个**非任务栈的栈指针**上被调用的（栈指针已损坏或
+来自已释放/被复用的栈），此前的“栈底槽被写坏”只是表象。下一步：在
+`switch_to`/trap 入口校验恢复的 rsp 是否落在登记过的任务栈内（kstack_protect 下
+可直接用 guard 页判定），以定位栈指针被破坏的第一现场。
 
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
@@ -831,18 +879,19 @@ CPU1: 关中断 → 调 flush_tlb_kernel_range_inner → 阻塞在 FLUSH_TLB_GLO
 | OCManager 功能验收 | 登录/JWT、项目列表、指标查询、sysdiagnose 命令列表全部真实 API 通过（§3.44） |
 | `docker commit` 导出层失败 | ext4 符号链接 xattr 读取改为 ENODATA（`8ca49350`，§3.44.2），净盘提交+运行验证通过 |
 | IRQ 独立栈（#DF） | 每 CPU IST 栈 + 门 8 `ist=1` + 零分配停机（`8f6156c9`，§3.45），故障注入验证无三重错误 |
+| TLB shootdown IRQ-off 互等 | 等待锁时服务入站请求 + CSD 指针置空（`99663970`，§3.46.3），guard 内核下 docker 拉起/容器/commit 通过 |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
 
 ### 4.2 待办（按优先级）
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）。2026-10-25 复现尝试为负：净盘 4G、以及 4G 下提交中被 SIGKILL 的脏盘均正常启动（§3.43.4），历史复现镜像已 clean。失败路径已改为无锁落盘 + 单层 owner 反查，下次命中可直接读 `CURRENT_PCB_DIAG`。下一步：先构造含孤儿 inode 的脏盘复现，再读 DIAG owner 追 PCB 生命周期 |
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 已成功读到 `CURRENT_PCB_DIAG`（§3.47）：失败时 `rsp` 不在任何已登记任务栈上，槽值恒为 `base+0x500`（4G/12G 同一签名）→ 真正问题是 **rsp 本身无效**，不是槽被写坏。下一步：在 `switch_to`/trap 入口校验 rsp 是否落在登记栈内（guard 页可直接判定），定位 rsp 被破坏的第一现场 |
 | 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
-| 6 | `kstack_protect` 在容器启动负载下 TLB shootdown 活锁 | §3.46：默认保持关闭；修复方向为 shootdown 请求合并/ack 配对，禁止在 IPI 处理上下文中再发起内核范围 shootdown |
+| 6 | `kstack_protect` 默认启用 | §3.46：flush 锁互等已修（`99663970`）；guard 下 docker/容器/commit 通过，但全栈 `/up_ocm.sh` 未跑通（停滞原因待查），保持默认关闭 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
