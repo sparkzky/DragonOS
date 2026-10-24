@@ -504,6 +504,20 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 ### 3.40 脏 journal 重放期 panic（复现，待定位）
 
+> 追加证据（同日）：用 `QEMU_GDB_WAIT=1`（`-S`）+ 硬件断点定位到首个 panic 的指令：
+> `do_softirq` 中的 `movzwl (%rax,%rdi,2)`，此时 `rax`（per-CPU pending 指针）为异常值，
+> 访问到用户地址（0x8/0xe2 等，每次不同）；随后 CPU1 在 `check_preempt_current` 触发
+> `do_undefined_opcode(6)`（pid=0，即 idle 上下文）。
+> 同一窗口内 clocksource watchdog 连续报：
+> `wdt unstable: cs=1278703605 (kvm-clock) wd=479251971 (acpi_pm) diff=799451634`、
+> `wdt unstable: cs=512000000 (jiffies) wd=741875573 (acpi_pm) diff=229875573`，
+> 随后打印 `clocksource: active source 'acpi_pm' is running backward or frozen; forcing reselection`。
+> 结论：panic 与「watchdog 误判 → 强制重选时钟源 → 时间回退」高度相关（gdb 暂停会放大该偏差，
+> 但净盘之外的两次无 gdb 复现同样带有 wdt 输出）。下一步应在 `active_clocksource_regressed()`
+> 与强制重选路径加时序证据，确认是误判还是重选后时间跳变。
+
+### 3.40 脏 journal 重放期 panic（复现，待定位）
+
 - 现象：上一次运行留下脏 journal（`dirty journal detected ... replaying now`）后启动，
   连续两次在重放期间 panic：
   - `fault.rs:358 Kernel code at <Softirq::do_softirq+0> illegally accessed user address`
