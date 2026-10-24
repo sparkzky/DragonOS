@@ -758,6 +758,33 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 **后续**：Linux 还把 NMI / #MC 放在 IST 上；本仓库目前只有 #DF。NMI 处理器若需迁到 IST，
 必须先解决它现在依赖 `current_pcb()` 的问题（同样只能用零分配通道或 per-CPU current）。
 
+## 3.46 `kstack_protect`（内核栈 guard page）默认启用评估：暂不启用（2026-10-25）
+
+目标：用 guard page 把“栈溢出静默破坏栈底 PCB 槽”（§3.40/§3.43 类故障）变成可定位的缺页。
+
+做法：`KERNEL_FEATURES=kstack_protect make kernel`（内核 #259），12G 启动。
+
+结果：
+
+| 场景 | 现象 |
+|---|---|
+| 启动（含脏 journal 重放） | 正常到 console |
+| `dragon-docker-start`（第 1 次） | 命令返回但 `/var/run/docker.sock` 不存在（dockerd 未就绪） |
+| `dragon-docker-start`（第 2 次，重启后单独执行） | >3 分钟无输出；gdb 多次采样：CPU0 固定停在 `mm/tlb::flush_tlb_multi` 的 `pause; movzbl 0x18(%r12),%edx; …` 轮询循环，CPU1 在 `flush_tlb_kernel_range_inner` 与 `current_pcb` 间移动，无 task dump、无 panic |
+
+判断：开启该特性后，每次内核栈分配/释放都会对 guard 映射做 `flush_tlb_kernel_range`，
+在容器启动这种高频线程创建场景下与 IPI TLB shootdown 形成**嵌套/丢失 ack 的活锁**
+（CPU0 一直等应答）。这与 §3.42.1 中“shootdown 调用者需合并、避免嵌套”的结论一致，
+但当前实现仍有可复现的缺口。
+
+结论：
+
+1. `kstack_protect` **不改为默认开启**，保持 `kernel/Cargo.toml` 中默认关闭；
+2. 之前“guard page 下 2/2 正常”只覆盖启动路径，不覆盖容器负载，本结论修正该记录；
+3. 后续修复方向：shootdown 请求合并（per-CPU pending mask 和 ack 计数必须原子配对），
+   或在 guard 映射 flush 时复用已有的“延迟 shootdown + 统一 flush”通道，禁止在
+   IPI 处理上下文中再次发起内核范围 shootdown。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -787,6 +814,7 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
+| 6 | `kstack_protect` 在容器启动负载下 TLB shootdown 活锁 | §3.46：默认保持关闭；修复方向为 shootdown 请求合并/ack 配对，禁止在 IPI 处理上下文中再发起内核范围 shootdown |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
