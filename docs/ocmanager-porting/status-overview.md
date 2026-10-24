@@ -478,53 +478,26 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 对齐 Linux：`fork_init()` 把 init 的 `RLIMIT_NPROC` 与 `RLIMIT_SIGPENDING` 都设为 `max_threads/2`；DragonOS 只设了 Sigpending（提交 `22032d92`）。
 - 验证：`ulimit -u=12259`；`/t41.sh` 输出 `OK41`/`P41=0` 且无 `No mapped vma` 日志；`docker run -d clickhouse/clickhouse-server:23.8.8.20` 正常 Up，`clickhouse-client -q 'select 1'` 返回 1。
 
+### 3.36 本轮回归（2026-10-24）
+
+| 项目 | 结果 |
+|---|---|
+| `ulimit -u` / `getconf CHILD_MAX` | 12259 / 12259 |
+| `docker run redis:7.2.3-alpine true` | `LIGHT=0` |
+| `/t41.sh`（ClickHouse entrypoint 前 41 行） | `OK41`、`P41=0`，无 SIGSEGV |
+| ClickHouse 容器 + `select 1` | `CH=0`，输出 `1` |
+| `/cowtest 500 1` | `c0=500` |
+| `/pietest 1000` | `bad=0` |
+
+> 备注：ClickHouse 启动期间 `Fetch` 线程出现过 `BLOCK STORM`（等待点 `address_space.rs:1987` 的 `mprotect_wait` 写锁），但随后自行恢复；该非致命长等待留待后续评估。
+
 ### 3.37 Go 服务启动崩溃：netlink IPv4 属性顺序（2026-10-24，已修复）
 
-- 现象：`oc-footstone:dev` 启动即 panic：
-  `net.newAddr index out of range [3] with length 3`（`net/interface_linux.go:180`）。
-- 归因：DragonOS 的 RTM_NEWADDR 属性顺序为 ADDRESS、BROADCAST、LABEL、LOCAL；
-  Linux `inet_fill_ifaddr()` 为 ADDRESS、LOCAL、LABEL、BROADCAST（本机实测确认）。
-  Go 标准库在检测到 IFA_LOCAL 后跳过 IFA_ADDRESS，取紧随其后的属性作为本地地址；
-  环回地址无广播，于是把 IFA_LABEL 的 3 字节负载当成 IPv4 地址。
+- 现象：`oc-footstone:dev` 启动即 panic：`net.newAddr index out of range [3] with length 3`（`net/interface_linux.go:180`）。
+- 归因：DragonOS 的 RTM_NEWADDR 属性顺序为 ADDRESS、BROADCAST、LABEL、LOCAL；Linux `inet_fill_ifaddr()` 为 ADDRESS、LOCAL、LABEL、BROADCAST（本机实测确认）。Go 标准库在检测到 IFA_LOCAL 后跳过 IFA_ADDRESS，取紧随其后的属性作为本地地址；环回地址无广播，于是把 IFA_LABEL 的 3 字节负载当成 IPv4 地址。
 - 修复：`addr_to_segment()` 改为 Linux 顺序（提交 `d9ba239b`）。
 - 验证：footstone 不再崩溃，21000 返回 `HTTP/1.0 200 OK`。
 
-### 3.38 OCManager 服务栈在 DragonOS 上跑通（2026-10-24）
-
-> 更新（2026-10-24 晚）：脚本已补上 oc-msg-etl 服务，且 footstone 的 `MSG_ETL`
-> 修正为 `ip://127.0.0.1:7778`（与 compose 一致）。最终 6 个容器全部 Up，
-> 21000 与 8080 均返回 `HTTP/1.0 200 OK`。
-
-### 3.39 utime(2) 实现与验证（2026-10-24）
-
-- 服务栈运行期持续出现 `Unsupported syscall ID: 132 -> SYS_UTIME`（约每 4 秒一次），说明有用户态程序依赖该调用。
-- 实现：`utime(filename, utimbuf{actime, modtime})` 转成两个 `tv_nsec=0` 的 `timespec`，
-  复用 `utimensat` 的解析/权限路径（AT_FDCWD、空 flags、跟随符号链接、`times==NULL` 表示当前时间）。
-- 验证：同栈重跑后该报错计数为 **0**，六服务正常。
-
-### 3.40 脏 journal 重放期 panic（复现，待定位）
-
-> 追加证据（同日）：用 `QEMU_GDB_WAIT=1`（`-S`）+ 硬件断点定位到首个 panic 的指令：
-> `do_softirq` 中的 `movzwl (%rax,%rdi,2)`，此时 `rax`（per-CPU pending 指针）为异常值，
-> 访问到用户地址（0x8/0xe2 等，每次不同）；随后 CPU1 在 `check_preempt_current` 触发
-> `do_undefined_opcode(6)`（pid=0，即 idle 上下文）。
-> 同一窗口内 clocksource watchdog 连续报：
-> `wdt unstable: cs=1278703605 (kvm-clock) wd=479251971 (acpi_pm) diff=799451634`、
-> `wdt unstable: cs=512000000 (jiffies) wd=741875573 (acpi_pm) diff=229875573`，
-> 随后打印 `clocksource: active source 'acpi_pm' is running backward or frozen; forcing reselection`。
-> 结论：panic 与「watchdog 误判 → 强制重选时钟源 → 时间回退」高度相关（gdb 暂停会放大该偏差，
-> 但净盘之外的两次无 gdb 复现同样带有 wdt 输出）。下一步应在 `active_clocksource_regressed()`
-> 与强制重选路径加时序证据，确认是误判还是重选后时间跳变。
-
-### 3.40 脏 journal 重放期 panic（复现，待定位）
-
-- 现象：上一次运行留下脏 journal（`dirty journal detected ... replaying now`）后启动，
-  连续两次在重放期间 panic：
-  - `fault.rs:358 Kernel code at <Softirq::do_softirq+0> illegally accessed user address`
-  - `trap.rs:369 do_undefined_opcode(6)`，rip 位于 `CpuRunQueue::check_preempt_current`
-  - 二次 panic 触发 `[nested-panic] ... parking`
-- 判定：与 utime/USB 无关——重建净盘后同一内核（#239）启动正常；属脏 journal 重放路径的
-  健壮性缺陷，需单独复现定位（与本轮已修复的三个自死锁无关联）。
 ### 3.38 OCManager 服务栈在 DragonOS 上跑通（2026-10-24）
 
 一键脚本见 `docs/ocmanager-porting/guest-stack-up.sh`（注入 guest 根目录后 `sh /up_ocm.sh`）：
@@ -539,25 +512,47 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | msg-etl | 8080 / 8081 / 7778 | Up，三端口 launch success |
 
 注意事项：
-- MySQL 用 `--initialize-insecure` 手动初始化，不会执行 `docker-entrypoint-initdb.d`；迁移必须显式
-  用 `mysql < file` 应用（脚本已包含）。
+- MySQL 用 `--initialize-insecure` 手动初始化，不会执行 `docker-entrypoint-initdb.d`；迁移必须显式用 `mysql < file` 应用（脚本已包含）。
 - ClickHouse 客户端不接受多语句，建库需分条执行。
 - footstone 的 `MSG_ETL` 必须指向 msg-etl 的 tRPC 端口 7778（此前脚本写成 7779）。
-- 仍观测到 `Unsupported syscall ID: 132 -> SYS_UTIME` 每数秒刷屏（进程未定位），以及
-  `/proc/net/tcp` 为空（procfs 缺口），均列入独立缺陷。
+- `/proc/net/tcp` 暂为空（procfs 缺口），列入独立缺陷。
 
-### 3.36 本轮回归（2026-10-24）
+### 3.39 utime(2) 实现与验证（2026-10-24）
 
-| 项目 | 结果 |
-|---|---|
-| `ulimit -u` / `getconf CHILD_MAX` | 12259 / 12259 |
-| `docker run redis:7.2.3-alpine true` | `LIGHT=0` |
-| `/t41.sh`（ClickHouse entrypoint 前 41 行） | `OK41`、`P41=0`，无 SIGSEGV |
-| ClickHouse 容器 + `select 1` | `CH=0`，输出 `1` |
-| `/cowtest 500 1` | `c0=500` |
-| `/pietest 1000` | `bad=0` |
+- 服务栈运行期持续出现 `Unsupported syscall ID: 132 -> SYS_UTIME`（约每 4 秒一次），说明有用户态程序依赖该调用。
+- 实现：`utime(filename, utimbuf{actime, modtime})` 转成两个 `tv_nsec=0` 的 `timespec`，复用 `utimensat` 的解析/权限路径（`AT_FDCWD`、空 flags、跟随符号链接、`times==NULL` 表示当前时间）。
+- 验证：同栈重跑后该报错计数为 **0**，六服务正常（提交 `079e38ea`）。
 
-> 备注：ClickHouse 启动期间 `Fetch` 线程出现过 `BLOCK STORM`（等待点 `address_space.rs:1987` 的 `mprotect_wait` 写锁），但随后自行恢复，容器正常就绪；该非致命长等待留待后续评估。
+### 3.40 脏 journal 重放期 panic（确定性复现，根因指向内核栈复用/溢出）
+
+- 现象：脏 journal 重放期间 panic：
+  - 首个：`do_softirq` 的 `movzwl (%rax,%rdi,2)`（`rax` 为 NULL，`cpu_id` 4/0x71 → 访问 0x8/0xe2）；
+  - 随后 CPU1 在 `check_preempt_current` 触发 `do_undefined_opcode(6)`（`pid=RawPid(0)`，idle 上下文）。
+- 复现资产：`/home/sparkzky/ocm-tars/dirty-journal-repro.img`（boot → docker 负载 → `kill -9` 后拷贝，100% 复现）。
+- 已排除：
+  | 假设 | 证据 |
+  |---|---|
+  | journal superblock 1KB 缓冲重叠 | 缓冲 `0xffff8003409e3000`，对象 `0xffff800340213000` |
+  | Softirq 被正常释放 | `Drop` 探针从未触发，`SOFTIRQ_VECTORS` 始终同一 box |
+  | 全局指针失效 | 损坏时 global 仍为 `0xffff800340213000` |
+- 损坏瞬间头部 dump（`do_softirq` 入口自检）：
+
+```
++0x00 = 0xffff8000017c2d13        (rodata)
++0x08 = 0x0a000c000a000d000e000260
++0x10 = 0x0072006b0069006e006700  (UTF-16 "rking"，来自 "...parking")
++0x18 = 0xffff8000017727e4        (rodata)
++0x20 = 0x1e   +0x28 = 0x1        (原 running_ptr/running_len)
++0x30 = 0xffff8000017c2d13
++0x38 = 0x26   +0x40 = 0x0000026500000001
++0x48 = 0xffff8000017c2d4c
++0x50 = 0xffff800340213070        (self + 0x70，自引用)
++0x58 = 0x1
+```
+
+- 结论：形态是 panic/格式化栈帧，且对象从未被 drop → 该堆页被内核栈/格式化路径复用后覆盖。
+- 下一步：为内核栈加 guard page 与溢出检测并记录溢出者（与「IRQ 独立栈」合并处理），再验证脏 journal 场景。
+- 旁证：同一窗口 clocksource watchdog 报 `kvm-clock` 与 `acpi_pm` 相差 ~0.8s 并 `forcing reselection`，时间回退可能放大该路径的时序敏感性。
 
 ## 4. 独立待办与当前阻断（2026-10-23）
 
