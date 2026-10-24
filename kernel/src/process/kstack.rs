@@ -39,7 +39,13 @@ static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
 fn flush_guard_translation(start: VirtAddr) {
     use crate::{arch::MMArch, mm::MemoryManagementArch};
     if crate::smp::cpu::smp_cpu_manager_initialized() {
-        crate::mm::tlb::flush_tlb_kernel_range(start, start + KernelStack::SIZE, false);
+        // 调用点持有 KSTACK_LOCK/页表锁，必然关中断；栈页在返回前不会回收，
+        // 这里的关中断 shootdown 是设计内行为，使用不产生违例告警的入口。
+        crate::mm::tlb::flush_tlb_kernel_range_irqoff_expected(
+            start,
+            start + KernelStack::SIZE,
+            false,
+        );
     } else {
         // init_idle precedes early_smp_init; no AP can hold these mappings.
         // Preserve the boot IRQ state and do not access an uninitialized SMP

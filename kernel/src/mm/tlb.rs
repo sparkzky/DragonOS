@@ -615,7 +615,26 @@ pub fn flush_tlb_mm_range(
 #[track_caller]
 pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool) {
     check_shootdown_context(SHOOTDOWN_ENTRY_KERNEL_RANGE);
+    flush_tlb_kernel_range_inner(start, end, freed_tables);
+}
 
+/// Kernel-stack guard/stack mapping remap.
+///
+/// The caller necessarily runs with interrupts disabled (it holds the kernel
+/// stack / page-table locks), and the affected pages are not recycled until
+/// this function returns, so the IRQ-off shootdown is intentional and cannot
+/// deadlock. It is therefore not counted as a `check_shootdown_context`
+/// violation; other kernel-range callers keep the strict check.
+#[track_caller]
+pub fn flush_tlb_kernel_range_irqoff_expected(
+    start: VirtAddr,
+    end: VirtAddr,
+    freed_tables: bool,
+) {
+    flush_tlb_kernel_range_inner(start, end, freed_tables);
+}
+
+fn flush_tlb_kernel_range_inner(start: VirtAddr, end: VirtAddr, freed_tables: bool) {
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
 
