@@ -397,6 +397,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 本轮复现尝试中，`docker run … /t41.sh` 启动阶段触发了一次 `TASK DUMP` 并停在挂起状态，未产生新的 #PF，探针数据待下一轮取得。
 - 复现时注意：先 `dragon-docker-start` 等 daemon 就绪（约 20s）再起容器，避免把 daemon 启动慢误判为挂起。
 
+### 3.25 复现环境不稳定：首容器启动可整机挂死（2026-10-24）
+- 净盘 + seed 引导后，`dragon-docker-start` 正常（`29.1.3 overlayfs`），但**第一个 `docker run`（clickhouse 镜像执行 41 行脚本）** 再次触发 `TASK DUMP: kernel stall detected, 77 tasks` 并整机 0 CPU 无响应。
+- 转储关键任务：`containerd-shim-runc-v2` 处于 futex（LSYSCALL=202）、`dash` 处于 `wait4`（LSYSCALL=61）、`virtio_blk_io_0` 不可中断、`ext4_journal` 阻塞 ⇒ 与既有 IO 停顿同域；随后无任何 CPU 活动，属硬挂死而非慢。
+- 影响：bash/bgpids 的现场采集被阻断；同一命令此前（#199）可完成 `P41=0`，说明为**概率性**，与镜像/命令无关。
+- 下一步优先查：① 该挂死是否为 TLB/IRQ 类死锁（可用 QEMU monitor 取两 CPU RIP，方法见 §3.11）；② `virtio_blk_io_0` 不可中断与 `ext4_journal` 阻塞是否构成完成链丢失（#2515 自检未覆盖此路径）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
