@@ -763,6 +763,10 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 # 编译（worktree 根，勿在 nix devshell 编 user 程序）
 make kernel
 
+# 格式化门禁：`make -C kernel fmt` 要求固定的 nightly-2026-02-24 与 clippy；
+# 在 nix 环境外执行会用本机默认 rustfmt 重排大量无关文件（且 clippy 以 101 失败）。
+# 非 nix 环境下只对自己的改动核对格式，切勿把整体重排提交进去。
+
 # 净盘重建（~90s；每次压测/容器测试前建议净盘，脏盘会 journal park）
 sudo rm -f bin/disk-image-x86_64.img && ROOTFS_MANIFEST=docker SKIP_GRUB=1 make write_diskimage
 
