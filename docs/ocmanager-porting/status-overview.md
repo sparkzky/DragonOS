@@ -434,6 +434,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 结论（推断已很强）：容器内某个多线程进程（Go 实现的 runc/containerd-shim 等）执行 exec，需要先让所有兄弟线程退出；其中某个线程长时间不退（阻塞在 futex/不可中断 IO），exec 的等待永不返回，容器启动挂死；此前 `do_user_addr_fault`/`wake_all` 栈帧是栈扫描噪声。
 - 下一步：① 在 `start_group_exec_transaction`/完成路径打印未完成 generation 与待退出 sibling tid 列表（超时 5s 触发一次）；② 在 stall dump 中把「同 tgid 的线程」一并列出，直接看出哪个 sibling 卡住；③ 复核 exec 的 sibling 终止流程是否会让处于 uninterruptible 等待的线程被强杀/唤醒。
 
+### 3.30 exec 等待的兄弟线程定位（2026-10-24 二次复现）
+- 两次独立复现的 `last wait site` 均为 `src/ipc/process_signal/exec.rs:32`（pid=648 / 650），即 `wait_group_exec_event_killable()`。
+- task dump 增加 tgid 后可见：`containerd-shim-runc-v2` 的多个线程同属 **tgid 591**，全部 `Blocked(true)` 且分别在 futex（LSYSCALL=202）、epoll/其他等待中；容器内 `bash`（tgid 615）阻塞在 `read`（LSYSCALL=0）。
+- 推断：多线程 Go 进程（shim/runc）执行 exec 时进入 group-exec 事务，等待所有兄弟线程退出；而兄弟线程停在 futex/epoll 上未被终止或未收到退出通知 ⇒ exec 永不返回，容器启动挂死。
+- 下一步：① 在 `start_group_exec_transaction`/完成回调打印未完成 generation 与待退出 sibling 的 tid/所属 tgid；② 核对 exec 终止 sibling 的路径（信号投递 → 线程在 futex 中是否可被 killable 唤醒）；③ 检查 `wait_group_exec_event_killable` 是否需要在 sibling 进入不可中断等待时返回 EINTR 而非永久等待。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
