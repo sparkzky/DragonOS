@@ -41,8 +41,9 @@ pub fn softirq_init() -> Result<(), SystemError> {
     }
     let (run_ptr, run_len) = debug_running_slots();
     crate::print_critical!(
-        "softirq init: box={:#x} running_ptr={:#x} running_len={}\n",
+        "softirq init: box={:#x} size={} running_ptr={:#x} running_len={}\n",
         softirq as usize,
+        core::mem::size_of::<Softirq>(),
         run_ptr,
         run_len
     );
@@ -135,6 +136,15 @@ pub struct Softirq {
     /// 软中断嵌套层数（per cpu）
     cpu_running_count: PerCpuVar<AtomicI16>,
 }
+impl Drop for Softirq {
+    fn drop(&mut self) {
+        // 诊断：Softirq 是全局单例，任何 drop 都意味着错误的所有权/重复释放，
+        // 会导致后续分配器把这块内存再次分配出去（已观测到 +0x20 起的 Vec 头
+        // 被 1KB 的 journal superblock 缓冲覆盖）。
+        crate::print_critical!("SOFTIRQ BOX DROPPED at {:p}\n", self);
+    }
+}
+
 impl Softirq {
     /// 每个CPU最大嵌套的软中断数量
     const MAX_RUNNING_PER_CPU: i16 = 3;
