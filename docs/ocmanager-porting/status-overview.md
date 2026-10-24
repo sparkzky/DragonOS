@@ -373,6 +373,16 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
   - 复现容器 41 行前缀时出现 `pid=577 (bash) No mapped vma, rip=0x67ca1, address=0x8, rdi=rsi=rdx=0`，但**没有任何 sigsetup 记录** ⇒ 该 bash 子进程未安装 SIGSEGV handler，按默认动作终止，不是 handler 二次故障。
 - 推论：全零寄存器就是**故障现场本身**；`rip=0x67ca1` 处指令为 `xor %eax,%eax`，与 `address=0x8` 不匹配，说明要么 trap frame 的 rip 不可靠（需打印 rip 处指令字节核对），要么该 rip 属于另一个（已被 exec/覆盖的）映像。下一步：在日志中同时输出 `cs/ss/rflags/old_rsp` 与 rip 处前 8 字节指令（经页表转换读取，避免二次缺页）。
 
+### 3.22 bash 崩溃：指令级确认（2026-10-24，关键进展）
+- 增强日志（`87180979`）输出 `cs/ss/rflags` 与 rip 处 8 字节指令。实机崩溃采样：
+  `rip=0x67ca1 address=0x8 cs=0x33 ss=0x2b rflags=0x10246 insn=[8b,77,08,83,fe,ff,74,35]`
+  → 字节即 `mov 0x8(%rdi),%esi`，在 `rdi=0` 时**正好访问 0x8**，与日志地址完全一致。
+- 符号解析：`0x67ca1 = PIE base 0x10000 + 文件 VMA 0x57ca1`（此前按文件偏移反汇编漏算 base，故误判为 `xor eax,eax`）。`addr2line` → **`initialize_flags`**（bash jobs 相关）；其前序指令 `mov 0xcb2b9(%rip),%rdx # bgpids`、`shl $0x4,%rdi; add %rdx,%rdi`，说明崩溃时 **`bgpids` 全局指针为 NULL** 且 pid=0。
+- 对照：加 `set +m`（关闭 job control）后同样崩溃（`PM=0` 但仍有该 fault），排除“job control 开关”这一表层差异；父脚本始终存活（`P41=0`），说明是**某个短命子 shell 的全局数据为 0**。
+- 下一步（两个方向）：
+  1. 验证子进程数据段：在子 shell 中打印已知全局（如 `BASH_VERSINFO`）与普通变量，确认是否出现“数据页被清零”；若是，则回到 COW/fork 数据页复制路径（与我们近期改动的 `do_wp_page` 相关）。
+  2. 若仅 `bgpids` 为 NULL，则查 bash 何时分配该表（`initialize_job_control`/`get_pid_stats`）并确认是否在 fork 早于初始化时被调用。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
