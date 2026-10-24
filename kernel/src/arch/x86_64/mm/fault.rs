@@ -355,6 +355,18 @@ impl X86_64MMArch {
                     return true; // 成功修复
                 }
                 // 如果异常表中没有，说明是bug
+                // 诊断：软中断对象若被写坏，这里能直接看到全局指针与其
+                // per-CPU 数组的底层 pair（NULL/越界会先于崩溃暴露出来）。
+                if crate::exception::softirq::softirq_vectors_raw() != 0 {
+                    let global = crate::exception::softirq::softirq_vectors_raw();
+                    let (run_ptr, run_len) = crate::exception::softirq::debug_running_slots();
+                    crate::print_critical!(
+                        "softirq state: global={:#x} running_ptr={:#x} running_len={}\n",
+                        global,
+                        run_ptr,
+                        run_len
+                    );
+                }
                 error!(
                     "Kernel code at {:#x} illegally accessed user address {:#x} \
                      without exception table entry",

@@ -39,8 +39,26 @@ pub fn softirq_init() -> Result<(), SystemError> {
         unsafe { drop(Box::from_raw(softirq)) };
         return Err(SystemError::EBUSY);
     }
+    let (run_ptr, run_len) = debug_running_slots();
+    crate::print_critical!(
+        "softirq init: box={:#x} running_ptr={:#x} running_len={}\n",
+        softirq as usize,
+        run_ptr,
+        run_len
+    );
     info!("Softirq initialized.");
     return Ok(());
+}
+
+/// 诊断：返回软中断全局指针的原始值（0 表示未初始化）。
+#[inline(always)]
+pub fn softirq_vectors_raw() -> usize {
+    SOFTIRQ_VECTORS.load(Ordering::Acquire) as usize
+}
+
+/// 诊断：输出 per-CPU 运行计数数组的底层指针/长度，用于定位对象损坏。
+pub fn debug_running_slots() -> (usize, usize) {
+    softirq_vectors().cpu_running_count().raw_parts()
 }
 
 #[inline(always)]

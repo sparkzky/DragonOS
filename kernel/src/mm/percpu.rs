@@ -80,6 +80,11 @@ impl<T> PerCpuVar<T> {
         Lazy::<Self>::new()
     }
 
+    /// 诊断：返回底层存储的 (ptr, len)，仅供取证输出使用。
+    pub fn raw_parts(&self) -> (usize, usize) {
+        (self.inner.as_ptr() as usize, self.inner.len())
+    }
+
     pub fn get(&self) -> &T {
         let cpu_id = smp_get_processor_id();
         &self.inner[cpu_id.data() as usize]
