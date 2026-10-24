@@ -1,14 +1,22 @@
 # DragonOS 运行 OCManager：问题现状与解决方案总览
 
-> 更新：2026-10-23 | 工作区：`~/DragonOS-ocmanager`（**原子提交**，基线 `ea126290`，工作区干净）
+> 更新：2026-10-24 | 工作区：`~/DragonOS-ocmanager`（**原子提交**，分支 `ocmanager-porting-2026-10`，工作区干净）
 > 流水账明细见 `fix-inventory-2026-10-18.md`；PR 拆分与合入状态见 `pr-split-2026-10-23.md`；本文是**可读总览**。
 
 ---
 
 ## 0. 一句话现状
 
-**R15 调度饥饿与 R16 死锁均已修复并验证**（`docker load` 全程零 panic/spinout，BADHALT 洪泛消失），修复已拆为 9 个 PR（#2507-#2515）。**容器层已跑通 MySQL（`ready for connections` + SQL 查询）、Redis（`PONG`）与 Kafka（KRaft，`kafka-topics --list` RC=0）**。
-当前剩余阻断按优先级：① **大镜像 `docker load` 楔死**（cp-kafka 416MB，mysql/redis/zk 正常）；② **bash `<(函数)` 崩溃**（父 bash SIGSEGV，阻断官方 mysql entrypoint，已最小复现）；③ **负载期 kvm-clock 较 acpi_pm 慢 ~13%**（watchdog 实测）；④ `fault.rs:1206/1223` 关中断 shootdown（仅 pinpoint）；⑤ 容器崩溃后 `docker run` 挂起（2-e）。
+**compose 基础设施已在 DragonOS 上跑通**：MySQL 8.0.35（`ready for connections` + `select version()`）、Redis（`PONG`）、ZooKeeper（`srvr`）、Kafka 3.5.1（KRaft，`kafka-topics --list` RC=0）；ClickHouse 23.8 镜像**可加载但 server 启动即崩**（归因为容器内 bash 子进程上下文损坏，非 CH 自身）。
+
+**镜像准备已从 50 分钟降到 0**：guest 内一次性 load 6 个 tar（8 个镜像，5.9GiB）→ 抽出 `/var/lib/docker` seed（2.3GiB，sha256 `ae0b9086…`）→ 写盘阶段注入；引导后 `docker images` 直接可见，`docker run redis` → `PONG`。
+
+**关机不再产生脏 journal**：新增 `shutdown_mounted_filesystems()`（sync + `on_umount` 清 RECOVER），实测重启无 `dirty journal detected`，磁盘可反复复用。
+
+当前待解（按优先级）：
+1. **bash 子进程上下文损坏**：容器内完整 `/entrypoint.sh` 触发 SIGSEGV（`rip=0x67ca1, addr=0x8, 全零寄存器`），阻塞 ClickHouse 与 footstone 部署；
+2. **时钟钳制窗口过小**：`wdt unstable cs=504000000 (jiffies) wd=644015370 (acpi_pm)`，单次 delta 被钳在 504ms，长停顿会丢时间并触发降频；
+3. Go 服务（footstone/msg-etl/sysdiagnose）镜像已构建（`ocservices.tar.gz`），待 CH 打通后完成部署收尾。
 
 ---
 
@@ -16,9 +24,37 @@
 
 - **目标**：在 DragonOS 上跑通 OCManager 运维平台（16 容器 compose 栈：MySQL/Redis/ZooKeeper/Kafka/ClickHouse + 11 Go 服务 + nginx）。
 - **方法**：修内核缺陷 → QEMU 验证 → mysql 容器 `ready for connections` → compose 全栈。
-- **环境**：QEMU(KVM, q35, 6G, 2vCPU)，共享服务器（注意其他会话会 pkill 清扫 QEMU）。
+- **环境**：QEMU(KVM, q35, **12G**, 2vCPU)，seed 盘零 load；共享服务器（注意其他会话会 pkill 清扫 QEMU）。
 
 ---
+
+### 1.1 迭代工作流（2026-10-24 起，单轮 ~2 分钟准备）
+
+```bash
+# 1) 一份预置 seed（一次性生成后可长期复用）
+SEED=~/ocm-tars/var-lib-docker-seed.tar.zst   # 2.3G，含 8 镜像
+
+# 2) 重建空盘并注入 seed（约 90s + 60s）
+sudo rm -f bin/disk-image-x86_64.img
+ROOTFS_MANIFEST=docker SKIP_GRUB=1 make write_diskimage
+LOOP=$(sudo losetup -fP --show bin/disk-image-x86_64.img)
+sudo mount ${LOOP}p1 /mnt/ocm-inject
+sudo mkdir -p /mnt/ocm-inject/var/lib/docker && sudo chmod 0710 /mnt/ocm-inject/var/lib/docker
+zstd -dc $SEED | sudo tar -x -C /mnt/ocm-inject/var/lib/docker --numeric-owner --xattrs --xattrs-include='*'
+sudo sync && sudo umount /mnt/ocm-inject && sudo losetup -d $LOOP
+
+# 3) 启动（12G；8G 在 load 大镜像时会 alloc-exhausted）
+cd tools && DRAGONOS_QEMU_MEMORY=12G ROOT_PATH=~/DragonOS-ocmanager \
+  bash run-qemu.sh --bios=legacy --display=nographic
+
+# 4) guest 内：无需 docker load
+dragon-docker-start && docker images
+
+# 5) 关机：新内核会 sync + 收尾文件系统（清 RECOVER），下次启动无 replay
+busybox poweroff -f
+```
+
+旧的 tar 注入 + `docker load` 流程仅在新镜像/新 seed 需要重建时使用（见 `prebuilt-image-strategy.md`）。
 
 ## 2. 已修复并实测验证的问题
 
