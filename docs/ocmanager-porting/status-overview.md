@@ -478,6 +478,38 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 对齐 Linux：`fork_init()` 把 init 的 `RLIMIT_NPROC` 与 `RLIMIT_SIGPENDING` 都设为 `max_threads/2`；DragonOS 只设了 Sigpending（提交 `22032d92`）。
 - 验证：`ulimit -u=12259`；`/t41.sh` 输出 `OK41`/`P41=0` 且无 `No mapped vma` 日志；`docker run -d clickhouse/clickhouse-server:23.8.8.20` 正常 Up，`clickhouse-client -q 'select 1'` 返回 1。
 
+### 3.37 Go 服务启动崩溃：netlink IPv4 属性顺序（2026-10-24，已修复）
+
+- 现象：`oc-footstone:dev` 启动即 panic：
+  `net.newAddr index out of range [3] with length 3`（`net/interface_linux.go:180`）。
+- 归因：DragonOS 的 RTM_NEWADDR 属性顺序为 ADDRESS、BROADCAST、LABEL、LOCAL；
+  Linux `inet_fill_ifaddr()` 为 ADDRESS、LOCAL、LABEL、BROADCAST（本机实测确认）。
+  Go 标准库在检测到 IFA_LOCAL 后跳过 IFA_ADDRESS，取紧随其后的属性作为本地地址；
+  环回地址无广播，于是把 IFA_LABEL 的 3 字节负载当成 IPv4 地址。
+- 修复：`addr_to_segment()` 改为 Linux 顺序（提交 `d9ba239b`）。
+- 验证：footstone 不再崩溃，21000 返回 `HTTP/1.0 200 OK`。
+
+### 3.38 OCManager 服务栈在 DragonOS 上跑通（2026-10-24）
+
+一键脚本见 `docs/ocmanager-porting/guest-stack-up.sh`（注入 guest 根目录后 `sh /up_ocm.sh`）：
+
+| 服务 | 端口 | 状态 |
+|---|---|---|
+| MySQL 8.0.35 | 3306 | Up；footstone 库与 4 个迁移已应用 |
+| Redis 7.2.3 | 6379 | Up，`PING` → PONG |
+| ClickHouse 23.8 | 9000 | Up，`select 1` → 1；msg_etl 库与 2 个迁移已应用 |
+| Kafka 3.5.1 (KRaft) | 9092 | Up，`kafka-topics.sh --list` RC=0 |
+| footstone | 21000 / 21001 / 21002 / 17778 | Up，HTTP 200 |
+| msg-etl | 8080 / 8081 / 7778 | Up，三端口 launch success |
+
+注意事项：
+- MySQL 用 `--initialize-insecure` 手动初始化，不会执行 `docker-entrypoint-initdb.d`；迁移必须显式
+  用 `mysql < file` 应用（脚本已包含）。
+- ClickHouse 客户端不接受多语句，建库需分条执行。
+- footstone 的 `MSG_ETL` 必须指向 msg-etl 的 tRPC 端口 7778（此前脚本写成 7779）。
+- 仍观测到 `Unsupported syscall ID: 132 -> SYS_UTIME` 每数秒刷屏（进程未定位），以及
+  `/proc/net/tcp` 为空（procfs 缺口），均列入独立缺陷。
+
 ### 3.36 本轮回归（2026-10-24）
 
 | 项目 | 结果 |
