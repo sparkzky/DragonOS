@@ -139,6 +139,22 @@ fn stall_watchdog_thread() -> i32 {
 
 /// 经关键通道转储所有任务的 pid / 名称 / 调度状态
 pub(crate) fn dump_all_tasks() {
+    // 诊断：打印最近一次进入公共等待入口的调用点，直接指出停摆时“谁在等”。
+    {
+        use core::sync::atomic::Ordering as O;
+        let file_ptr = crate::libs::wait_queue::LAST_WAIT_SITE_FILE.load(O::Relaxed);
+        let len = crate::libs::wait_queue::LAST_WAIT_SITE_LEN.load(O::Relaxed);
+        if !file_ptr.is_null() && len > 0 {
+            let bytes = unsafe { core::slice::from_raw_parts(file_ptr, len) };
+            let file = core::str::from_utf8(bytes).unwrap_or("<invalid>");
+            crate::println_critical!(
+                "last wait site: {}:{} (pid={})\n",
+                file,
+                crate::libs::wait_queue::LAST_WAIT_SITE_LINE.load(O::Relaxed),
+                crate::libs::wait_queue::LAST_WAIT_SITE_PID.load(O::Relaxed)
+            );
+        }
+    }
     let procs = match crate::process::snapshot_all_processes() {
         Ok(p) => p,
         Err(_) => {

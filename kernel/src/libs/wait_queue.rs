@@ -5,6 +5,7 @@
 // The wait_until family returns Option<R>, allowing direct return of acquired resources.
 // The wait_event family (returning bool) is implemented on top of wait_until for compatibility.
 
+use core::sync::atomic::AtomicPtr;
 use core::{
     intrinsics::unlikely,
     marker::PhantomData,
@@ -86,6 +87,33 @@ struct WakerData {
 }
 
 #[allow(dead_code)]
+
+/// 诊断：最近一次进入公共等待入口的调用点（文件/行/pid）。
+/// stall watchdog 在整机停顿时打印它，直接指出“谁在等”。
+pub static LAST_WAIT_SITE_FILE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+pub static LAST_WAIT_SITE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static LAST_WAIT_SITE_LINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static LAST_WAIT_SITE_PID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+#[inline]
+pub(crate) fn record_wait_site(loc: &'static core::panic::Location<'static>) {
+    // 仅记录用户任务的等待点：内核线程长期等待会覆盖掉真正的现场。
+    let pcb = crate::process::ProcessManager::current_pcb();
+    if pcb
+        .flags()
+        .contains(crate::process::ProcessFlags::KTHREAD)
+    {
+        return;
+    }
+    LAST_WAIT_SITE_FILE.store(loc.file().as_ptr() as *mut u8, Ordering::Relaxed);
+    LAST_WAIT_SITE_LEN.store(loc.file().len(), Ordering::Relaxed);
+    LAST_WAIT_SITE_LINE.store(loc.line() as usize, Ordering::Relaxed);
+    LAST_WAIT_SITE_PID.store(
+        crate::process::ProcessManager::current_pid().data() as i32,
+        Ordering::Relaxed,
+    );
+}
+
 impl WaitQueue {
     pub const fn default() -> Self {
         WaitQueue {
@@ -481,6 +509,7 @@ impl WaitQueue {
     // These are implemented on top of wait_until for backward compatibility.
 
     /// 可中断等待条件成立；`before_sleep` 在入队后、睡眠前执行（用于解锁等操作）
+    #[track_caller]
     pub fn wait_event_interruptible<F, B>(
         &self,
         mut cond: F,
@@ -490,6 +519,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
@@ -503,6 +533,7 @@ impl WaitQueue {
     /// Wait interruptibly while publishing a caller-defined class tag on the
     /// waiter. The tag lets a wakeup source select one eligible class without
     /// disturbing unrelated waiters on the same queue.
+    #[track_caller]
     pub fn wait_event_interruptible_tagged<F>(
         &self,
         tag: usize,
@@ -511,6 +542,7 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         if tag == DEFAULT_WAIT_TAG {
             return Err(SystemError::EINVAL);
         }
@@ -528,6 +560,7 @@ impl WaitQueue {
     ///
     /// 用于块设备 IO、网络 IO 等场景。会设置 IN_IOWAIT 标志，使得 CPU 空闲时间
     /// 能够正确区分 iowait 和 pure idle。
+    #[track_caller]
     pub fn wait_event_io_interruptible<F, B>(
         &self,
         mut cond: F,
@@ -537,6 +570,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
@@ -547,6 +581,7 @@ impl WaitQueue {
         )
     }
 
+    #[track_caller]
     pub fn wait_event_killable<F, B>(
         &self,
         mut cond: F,
@@ -556,6 +591,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Killable,
@@ -567,6 +603,7 @@ impl WaitQueue {
     }
 
     /// 不可中断等待条件成立
+    #[track_caller]
     pub fn wait_event_uninterruptible<F, B>(
         &self,
         mut cond: F,
@@ -576,6 +613,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
@@ -590,6 +628,7 @@ impl WaitQueue {
     ///
     /// - `timeout == None`：无限等待，直到条件成立或收到信号（返回 `ERESTARTSYS`）
     /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`
+    #[track_caller]
     pub fn wait_event_interruptible_timeout<F>(
         &self,
         mut cond: F,
@@ -598,6 +637,7 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
@@ -611,6 +651,7 @@ impl WaitQueue {
     /// 可中断等待 IO 操作完成，支持可选超时
     ///
     /// 用于块设备、网络 socket 等 IO 操作。正确标记为 IO 等待以用于 iowait 统计。
+    #[track_caller]
     pub fn wait_event_io_interruptible_timeout<F>(
         &self,
         mut cond: F,
@@ -619,6 +660,7 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
@@ -633,6 +675,7 @@ impl WaitQueue {
     ///
     /// - `timeout == None`：无限等待，直到条件成立。
     /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`。
+    #[track_caller]
     pub fn wait_event_uninterruptible_timeout<F>(
         &self,
         mut cond: F,
@@ -641,6 +684,7 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
@@ -654,6 +698,7 @@ impl WaitQueue {
     /// `wait_event_interruptible_timeout` 的扩展版本：提供 `before_sleep` 钩子。
     ///
     /// 典型用途：入队后、睡眠前释放锁（避免持锁睡眠）。
+    #[track_caller]
     pub fn wait_event_interruptible_timeout_with<F, B>(
         &self,
         mut cond: F,
@@ -664,6 +709,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        record_wait_site(core::panic::Location::caller());
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
@@ -1288,10 +1334,12 @@ impl EventWaitQueue {
         guard.retain(|(_, waker)| !Arc::ptr_eq(waker, target));
     }
 
+    #[track_caller]
     pub fn wait_event_interruptible<F>(&self, events: u64, mut cond: F) -> Result<(), SystemError>
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         before_sleep_check(0);
         if cond() {
             return Ok(());
@@ -1326,6 +1374,7 @@ impl EventWaitQueue {
         }
     }
 
+    #[track_caller]
     pub fn wait_event_interruptible_timeout<F>(
         &self,
         events: u64,
@@ -1335,6 +1384,7 @@ impl EventWaitQueue {
     where
         F: FnMut() -> bool,
     {
+        record_wait_site(core::panic::Location::caller());
         before_sleep_check(0);
         if cond() {
             return Ok(());
