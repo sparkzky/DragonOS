@@ -643,6 +643,24 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 下一步：用 `CURRENT_PCB_DIAG` 的 owner 字段确认该栈属于哪个任务，再追该任务的 PCB 生命周期
 （为何 Strong 归零或槽被覆盖）。
 
+### 3.43.4 2026-10-25 复现尝试（负结果）
+
+| 配置 | 结果 |
+|---|---|
+| 净盘重建 + seed，`DRAGONOS_QEMU_MEMORY=4G`，内核 #255 | 正常启动到 console |
+| 4G 下 `docker create oc-msg-etl:dev` + `docker commit` 进行中 `SIGKILL` QEMU（制造脏 journal / 孤儿 inode），再以 4G 启动 | 正常启动到 console，ext4 重放完成 |
+
+历史资产 `dirty-journal-repro.img` / `dirty-journal-repro2.img` 经 `dumpe2fs -h` 检查均为
+`Filesystem state: clean`（被后续启动重放），原始脏状态已不可得。
+
+因此“4G 必现”的前提已不成立：故障依赖特定磁盘状态（根挂载期 journal/孤儿链重放），
+当前内核 + 现有磁盘无法复现。复现条件需重新构造（例如在含孤儿 inode 的盘上掉电），
+在此之前该缺陷定位停在此处。
+
+同期对失败路径做了去递归改造（`record_current_pcb_diag` 先无锁落盘 base/slot/rsp/magic，
+owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIAG` 一定可读、且不会因诊断
+本身无限套娃。
+
 ## 3.44 OCManager 全栈功能验收（2026-10-25，内核 #253）
 
 净盘启动后不再只做“进程 Up + 健康检查”，而是对每条业务链路做真实 API 调用
@@ -730,7 +748,7 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 4G 必现、12G 脏 journal 亦现；首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）；已加 `CURRENT_PCB_DIAG` + `find_task_by_stack_base`（`7359d0df`）。下一步：读 DIAG owner → 追 PCB 生命周期/槽覆盖来源。另注：本轮复现到失败路径的自递归——`SpinLock::lock_irqsave` → `preempt_disable` → `current_pcb` 再次失败 → 记录 DIAG（同样取锁），最终以嵌套 panic parking 结束；修复时应让 DIAG/panic 路径完全无锁且不依赖 `current_pcb` |
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）。2026-10-25 复现尝试为负：净盘 4G、以及 4G 下提交中被 SIGKILL 的脏盘均正常启动（§3.43.4），历史复现镜像已 clean。失败路径已改为无锁落盘 + 单层 owner 反查，下次命中可直接读 `CURRENT_PCB_DIAG`。下一步：先构造含孤儿 inode 的脏盘复现，再读 DIAG owner 追 PCB 生命周期 |
 | 2 | IRQ 独立栈（Linux IST） | 未开始 |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
