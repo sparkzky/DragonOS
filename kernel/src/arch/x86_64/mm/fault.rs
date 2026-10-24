@@ -570,6 +570,16 @@ impl X86_64MMArch {
                         .and_then(|reader| reader.read_one_from_user::<[u8; 8]>(0))
                         .map(|bytes| bytes)
                         .ok();
+                        // 临时诊断：bash PIE 基址实测为 0x10000，bgpids 全局在 0x122f50。
+                        // 读取其 storage(0..8)/nalloc/... 以确认是否未初始化。
+                        let bgpids = crate::syscall::user_access::UserBufferReader::new(
+                            0x122f50 as *const u8,
+                            32,
+                            true,
+                        )
+                        .and_then(|reader| reader.read_one_from_user::<[u8; 32]>(0))
+                        .map(|b| b)
+                        .ok();
                         log::error!(
                             "pid: {} ({}) No mapped vma, error_code: {:?}, rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, cs:{:#x}, ss:{:#x}, rflags:{:#x}, insn:{:02x?}, flags: {:?}",
                             ProcessManager::current_pid().data(),
@@ -588,6 +598,16 @@ impl X86_64MMArch {
                             insn,
                             flags
                         );
+                        if let Some(b) = bgpids {
+                            log::error!(
+                                "bgpids@0x122f50: storage={:#x} nalloc={} head={} npid={} raw={:02x?}",
+                                u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                                u32::from_le_bytes(b[8..12].try_into().unwrap()),
+                                u32::from_le_bytes(b[12..16].try_into().unwrap()),
+                                u32::from_le_bytes(b[16..20].try_into().unwrap()),
+                                b
+                            );
+                        }
 
                         send_segv_maperr();
                         return;
