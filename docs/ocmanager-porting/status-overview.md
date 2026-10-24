@@ -567,15 +567,15 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 | 提交 | 修复 | 上游状态 |
 |---|---|---|
-| `22032d92` | 默认 `RLIMIT_NPROC = max_threads/2`（对齐 Linux `fork_init`），修复容器内 bash `bgpids` SIGSEGV | master 缺失 |
-| `d9ba239b` | netlink IPv4 地址属性顺序对齐 Linux（Go `net.Interfaces()` 越界修复） | master 仍是旧顺序 |
-| `079e38ea` | 实现 `utime(2)` | master 无该文件 |
-| `51f76477` | `run-qemu.sh` 尊重外部 `QEMU_GDB_WAIT` | master 仍硬编码 0 |
-| `da015b03` | kstack guard 映射 flush 走“有意关中断”shootdown 入口 | master 无该入口 |
-| `8d93771f` | 关机前 flush 并关闭已挂载文件系统（清 RECOVER） | master 缺失 |
-| `91d99943` | watchdog 降级判定可见（需改走 `error!`，因 master 无 critical 通道） | master 缺失 |
-| `6e28e905`+`bfa520a7`+`0f2198ef` | 缺页路径 TLB flush 系列（延迟 shootdown / 共享 helper） | master 缺失 |
-| `7fb4de4f` | clocksource fallback + APIC 重校准（部分已随 #2490 合并） | 需按差异提取 |
+| `22032d92` | 默认 `RLIMIT_NPROC = max_threads/2`（对齐 Linux `fork_init`），修复容器内 bash `bgpids` SIGSEGV | **PR #2534** |
+| `d9ba239b` | netlink IPv4 地址属性顺序对齐 Linux（Go `net.Interfaces()` 越界修复） | **PR #2536** |
+| `079e38ea` | 实现 `utime(2)` | **PR #2537** |
+| `51f76477` | `run-qemu.sh` 尊重外部 `QEMU_GDB_WAIT` | **PR #2538** |
+| `da015b03` | kstack guard 映射 flush 走“有意关中断”shootdown 入口 | **不开 PR**：master 的 `flush_tlb_kernel_range_inner` 已对 IF=0 调用者临时开中断 |
+| `8d93771f` | 关机前 flush 并关闭已挂载文件系统（清 RECOVER） | **PR #2541** |
+| `91d99943` | watchdog 降级判定可见（改用非阻塞 WARN 通道） | **PR #2540** |
+| `6e28e905`+`bfa520a7`+`0f2198ef` | 缺页路径 TLB flush 系列（延迟 shootdown / 共享 helper） | **PR #2543** |
+| `7fb4de4f` | clocksource fallback + APIC 重校准（部分已随 #2490 合并） | **PR #2544**（仅净增量） |
 
 ### 3.42.2 仅本分支的脚手架/诊断（不开 PR）
 
