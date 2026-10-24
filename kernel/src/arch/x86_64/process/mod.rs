@@ -597,15 +597,36 @@ pub static CURRENT_PCB_DIAG: [core::sync::atomic::AtomicU64; 6] = [
     core::sync::atomic::AtomicU64::new(0),
 ];
 
-fn record_current_pcb_diag(base: usize, slot: usize, rsp: usize) {
+/// owner 反查需要取进程表锁，而加锁路径（preempt_disable）会再次进入
+/// `current_pcb`；失败期间一旦递归就会无限套娃。用原子标志保证同一时刻
+/// 只有一层做反查，其余层直接放弃。
+static DIAG_IN_PROGRESS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+const DIAG_MAGIC: u64 = 0x5a5a_5a5a;
+
+fn record_current_pcb_diag(
+    base: usize,
+    slot: usize,
+    rsp: usize,
+) -> Option<(crate::process::RawPid, u8)> {
     use core::sync::atomic::Ordering;
-    let owner = crate::process::find_task_by_stack_base(base);
+    // 与锁无关的现场先落盘：即使接下来取锁递归/panic，gdb 也能读到。
     CURRENT_PCB_DIAG[0].store(base as u64, Ordering::Relaxed);
     CURRENT_PCB_DIAG[1].store(slot as u64, Ordering::Relaxed);
-    CURRENT_PCB_DIAG[2].store(owner.map(|(pid, _)| pid.data() as u64).unwrap_or(u64::MAX), Ordering::Relaxed);
-    CURRENT_PCB_DIAG[3].store(owner.map(|(_, kind)| kind as u64).unwrap_or(0), Ordering::Relaxed);
     CURRENT_PCB_DIAG[4].store(rsp as u64, Ordering::Relaxed);
-    CURRENT_PCB_DIAG[5].store(0x5a5a_5a5a, Ordering::Relaxed);
+    CURRENT_PCB_DIAG[5].store(DIAG_MAGIC, Ordering::Release);
+
+    if DIAG_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let owner = crate::process::find_task_by_stack_base(base);
+    if let Some((pid, kind)) = owner {
+        CURRENT_PCB_DIAG[2].store(pid.data() as u64, Ordering::Relaxed);
+        CURRENT_PCB_DIAG[3].store(kind as u64, Ordering::Relaxed);
+    }
+    DIAG_IN_PROGRESS.store(false, Ordering::Release);
+    owner
 }
 
 impl ProcessControlBlock {
@@ -620,9 +641,7 @@ impl ProcessControlBlock {
         let p = stack_base.data() as *const *const ProcessControlBlock;
         let slot = unsafe { *p };
         if unlikely(slot.is_null()) {
-            record_current_pcb_diag(stack_base.data(), 0, ptr.data());
-            error!("p={:p}", p);
-            let owner = crate::process::find_task_by_stack_base(stack_base.data());
+            let owner = record_current_pcb_diag(stack_base.data(), 0, ptr.data());
             panic!(
                 "current_pcb is null: stack_base={:#x} owner={:?}",
                 stack_base.data(),
@@ -669,9 +688,8 @@ impl ProcessControlBlock {
                 None => {
                     // 失败路径无法安全打印（当前可能正持有 console 锁），把
                     // 现场写入静态变量，供 gdb 读取。
-                    record_current_pcb_diag(stack_base.data(), slot as usize, ptr.data());
                     let owner =
-                        crate::process::find_task_by_stack_base(stack_base.data());
+                        record_current_pcb_diag(stack_base.data(), slot as usize, ptr.data());
                     panic!(
                         "current_pcb weak upgrade failed (pcb freed?): stack_base={:#x} slot={:#x} owner={:?}",
                         stack_base.data(),
