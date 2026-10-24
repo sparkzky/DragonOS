@@ -680,12 +680,32 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 4. **Kafka 日志里的 `No mapped vma ... address: 0x8` 属正常**：HotSpot 隐式空指针检查产生的
    SIGSEGV 由 JVM 自身 handler 恢复（本次 12 次，`kafka-topics --list` 随后成功）。
 
-### 3.44.2 验收中新发现的缺口
+### 3.44.2 验收中发现并已修复的缺口：`docker commit` 导出层失败
 
-- **`docker commit` 无法导出层**：`CreateDiff` 失败于
-  `failed to get xattr for .../bin/arch: operation not permitted`（overlay/containerd diff 路径）。
-  本次因此改用原始 `docker run` 重建容器；待排查 `getxattr` 在 overlay 挂载上的 EPERM
-  是否与 §3.42.3 的 xattr 缺口同源。
+**现象**：`docker commit etl oc-msg-etl:jwt` 失败：
+`failed to export layer: CreateDiff ... failed to get xattr for .../bin/arch: operation not permitted`。
+
+**根因**：`ext4` 的 `getxattr` 对符号链接 inode 一律返回 `EPERM`
+（`kernel/src/filesystem/ext4/inode.rs`）。containerd 的 `CreateDiff` 会对每个条目
+读 `security.capability`，命中符号链接即整层导出失败。
+
+**Linux 6.6 实测**（宿主 ext4，`/home` 为 ext2/ext3 系 ext4 兼容挂载）：
+
+| 名称 | 跟随符号链接 | 不跟随 | 结果 |
+|---|---|---|---|
+| `security.capability` | ENODATA(61) | ENODATA(61) | 无属性 |
+| `user.foo` | ENODATA(61) | ENODATA(61) | 无属性 |
+| `trusted.foo` | ENODATA(61) | ENODATA(61) | 无属性 |
+
+即符号链接不承载扩展属性，读取统一是 `ENODATA`；写入才由 VFS 的
+`xattr_permission` 拒绝为 `EPERM`。
+
+**修复**（`8ca49350`）：`ext4::getxattr` 对 `FileType::SymLink` 返回 `ENODATA`。
+
+**验证**：净盘（重新 seed）启动内核 #254 → `docker create --name ctest oc-msg-etl:dev` →
+`docker commit ctest ctest:one` 返回 `sha256:c33b74e8c923…`（RC=0）→
+`docker run --rm --entrypoint sh ctest:one -c 'ls -l /bin/arch'` 输出
+`/bin/arch -> /bin/busybox`（RC=0）。同一操作在修复前稳定失败。
 
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
@@ -703,18 +723,18 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | `is_kthread` 分类、`futex_wake nr_wake=0` | 已证伪（§3.42.3-5/6） |
 | R15 全栈与 mysql 终验 | 净盘六服务验收通过（§3.42.1b） |
 | OCManager 功能验收 | 登录/JWT、项目列表、指标查询、sysdiagnose 命令列表全部真实 API 通过（§3.44） |
+| `docker commit` 导出层失败 | ext4 符号链接 xattr 读取改为 ENODATA（`8ca49350`，§3.44.2），净盘提交+运行验证通过 |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
 
 ### 4.2 待办（按优先级）
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 4G 必现、12G 脏 journal 亦现；首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）；已加 `CURRENT_PCB_DIAG` + `find_task_by_stack_base`（`7359d0df`）。下一步：读 DIAG owner → 追 PCB 生命周期/槽覆盖来源 |
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 4G 必现、12G 脏 journal 亦现；首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）；已加 `CURRENT_PCB_DIAG` + `find_task_by_stack_base`（`7359d0df`）。下一步：读 DIAG owner → 追 PCB 生命周期/槽覆盖来源。另注：本轮复现到失败路径的自递归——`SpinLock::lock_irqsave` → `preempt_disable` → `current_pcb` 再次失败 → 记录 DIAG（同样取锁），最终以嵌套 panic parking 结束；修复时应让 DIAG/panic 路径完全无锁且不依赖 `current_pcb` |
 | 2 | IRQ 独立栈（Linux IST） | 未开始 |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
-| 6 | `docker commit` 导出层失败（`get xattr ... operation not permitted`） | §3.44.2；待判定是 overlay 上的 getxattr 语义缺口，还是 containerd diff 的 xattr 集合问题 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
