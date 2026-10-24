@@ -229,10 +229,16 @@ pub fn init_local() {
 }
 
 pub fn reprogram_local() {
-    let queue = QUEUES[smp_get_processor_id().data() as usize].lock_irqsave();
-    if queue.ready {
-        program_locked(&queue);
+    {
+        let queue = QUEUES[smp_get_processor_id().data() as usize].lock_irqsave();
+        if queue.ready {
+            program_locked(&queue);
+        }
     }
+    // Reporting must never run inside the IRQ-off queue/timer critical section.
+    // This point holds neither lock; the reporter is a no-op unless IRQs are on.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::driver::apic::apic_timer::report_deadline_clamps();
 }
 
 fn program_locked(queue: &Queue) {

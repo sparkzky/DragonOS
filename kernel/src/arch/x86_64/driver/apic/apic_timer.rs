@@ -7,6 +7,7 @@ use crate::arch::driver::{
     tsc::TSCManager,
 };
 use crate::arch::interrupt::TrapFrame;
+use crate::arch::CurrentIrqArch;
 use crate::driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_MASK, PMTMR_TICKS_PER_SEC};
 use crate::driver::base::device::DeviceId;
 use crate::driver::clocksource::acpi_pm::PMTMR_IO_PORT;
@@ -15,6 +16,7 @@ use crate::exception::irqdesc::{
     irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
 };
 use crate::exception::manage::irq_manager;
+use crate::exception::InterruptArch;
 use crate::exception::IrqNumber;
 
 use crate::mm::percpu::PerCpu;
@@ -365,6 +367,41 @@ impl LocalApicTimer {
     }
 }
 
+/// Number of one-shot requests whose converted APIC count exceeded the
+/// 32-bit counter range.
+///
+/// Recorded atomically at the observation site; never printed there. The
+/// deadline queue calls [`report_deadline_clamps`] after releasing its
+/// IRQ-off critical section and the timer borrow.
+static DEADLINE_CLAMP_EVENTS: AtomicU64 = AtomicU64::new(0);
+static DEADLINE_CLAMP_REPORTED: AtomicU64 = AtomicU64::new(0);
+static DEADLINE_CLAMP_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// Report accumulated over-range deadline clamps.
+///
+/// Must run in process context with interrupts enabled and without holding the
+/// deadline queue or the local timer borrow; otherwise this is a no-op and the
+/// events stay pending for the next safe call.
+pub(crate) fn report_deadline_clamps() {
+    if !CurrentIrqArch::is_irq_enabled() {
+        return;
+    }
+    let total = DEADLINE_CLAMP_EVENTS.load(Ordering::Acquire);
+    let reported = DEADLINE_CLAMP_REPORTED.swap(total, Ordering::AcqRel);
+    if total == reported {
+        return;
+    }
+    // Bound the diagnostics; the counter keeps accumulating after the budget.
+    if DEADLINE_CLAMP_LINES.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    warn!(
+        "apic timer: {} one-shot deadline(s) exceeded the counter range and were clamped (total={})",
+        total - reported,
+        total
+    );
+}
+
 /// Caller holds the local deadline queue with local IRQs disabled. Never keep
 /// this RefCell borrow alive while dispatching a deadline callback.
 pub(crate) fn program_deadline_delta(delta_ns: u64) {
@@ -372,22 +409,11 @@ pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let raw = (delta_ns as u128 * timer.periodic_count as u128)
         .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000);
     if raw > u32::MAX as u128 {
-        // 请求的 delta 超出计数器范围，说明 tick 期限已被毒化（正常路径
-        // delta <= 1 tick）。此前这里静默截断为 u32::MAX：下一次 tick 被
-        // 推迟数秒到数分钟，而现场没有任何线索。
-        // 本函数运行在 deadline 队列的关中断临界区内，因此告警必须自带
-        // 节流（不做 console 直写、不形成 printk 风暴）：前 8 次与之后
-        // 每 1024 次各记录一条。
-        static OVERFLOW_WARNED: AtomicU64 = AtomicU64::new(0);
-        let n = OVERFLOW_WARNED.fetch_add(1, Ordering::Relaxed);
-        if n < 8 || n.is_multiple_of(1024) {
-            warn!(
-                "apic timer: one-shot delta {}ns exceeds counter range, clamped (n={}, pcount={})",
-                delta_ns,
-                n + 1,
-                timer.periodic_count
-            );
-        }
+        // A normal path requests at most one tick; reaching the counter limit
+        // means the absolute tick deadline was corrupted. Clamp so the timer
+        // still fires and the deadline queue can re-anchor, and record the
+        // event for a safe reporter instead of logging in this IRQ-off region.
+        DEADLINE_CLAMP_EVENTS.fetch_add(1, Ordering::Relaxed);
     }
     let count = raw.clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
