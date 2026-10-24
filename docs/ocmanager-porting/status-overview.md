@@ -440,6 +440,15 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 推断：多线程 Go 进程（shim/runc）执行 exec 时进入 group-exec 事务，等待所有兄弟线程退出；而兄弟线程停在 futex/epoll 上未被终止或未收到退出通知 ⇒ exec 永不返回，容器启动挂死。
 - 下一步：① 在 `start_group_exec_transaction`/完成回调打印未完成 generation 与待退出 sibling 的 tid/所属 tgid；② 核对 exec 终止 sibling 的路径（信号投递 → 线程在 futex 中是否可被 killable 唤醒）；③ 检查 `wait_group_exec_event_killable` 是否需要在 sibling 进入不可中断等待时返回 EINTR 而非永久等待。
 
+### 3.31 exec group 等待：代码级竞态分析（2026-10-24）
+`de_thread()`（`kernel/src/process/exec.rs:439`）流程：收集 sibling → 每个未完成 unhash 的 sibling `assign_group_exec_generation(g)` 且 `pending++` → 对 kill_list 投递私有 SIGKILL → `wait_group_exec_event_killable(group_exec_pending_complete)`。
+计数由退出路径 `mark_identity_unhash_complete()` 后调用 `complete_group_exec_task()` 递减（`process/exit.rs:1099`）。
+两个可疑窗口：
+1. **`group_dead == true` 时跳过 `complete_group_exec_task`**：若最后一个 sibling 以 group_dead 退出，而它已被计入 pending，则计数不再递减；
+2. **旧 leader 阶段**：非 leader exec 还要等 `group_exec_handoff_ready`（phase 需为 Ready，由 `complete_group_exec_leader_exit` 在旧 leader exit_notify_complete 时推进）；若旧 leader 的退出通知依赖已被 kill 的 sibling，二者互等。
+- 说明：collect 与计数写入均在 signal 内锁内完成，因此“退出路径先看到 GROUP_EXEC 未设置”的窗口基本被排除；重点转向上面两条。
+- 下一步探针：给 `group_exec_notify_count` 与 `group_exec_leader_phase` 加只读查询，在 de_thread 的等待处按 1s 分片打印 `(count, phase, kill_list 长度)`，即可区分是计数不降还是 leader 阶段卡住。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
