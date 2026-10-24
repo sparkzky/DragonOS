@@ -343,7 +343,9 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 现象：`busybox poweroff -f` 前即使 `sync`，rw 挂载的 ext4 仍保留未提交 journal；下次启动 `dirty journal detected ... replaying` 偶发 **nested-panic park**（重放与并发打印/状态不一致），导致镜像盘不可复用。
 - 根因：`kernel_power_off()` 只做 notifier + `device_shutdown()`，缺少 Linux 语义的 `sync` + `remount-ro`（`mount -o remount,ro /` 在 DragonOS 上返回 `Not supported`，RM=255）。
 - 修复：新增 `vfs::mount::shutdown_mounted_filesystems()`（`git 8d93771f`）——对每个可写挂载执行 `sync_fs(wait)` 后调用 `FileSystem::on_umount()`；ext4 的 `on_umount` 已是 `flush_dirty_inodes + journal.shutdown + shutdown_writable()`（清 RECOVER）。在 `kernel_shutdown_prepare()` 中 `device_shutdown()` 之前调用。
-- 实测（#196 / 12G / seed 盘）：启动 → `dragon-docker-start` → `docker run redis` → `busybox poweroff -f` → 再次启动 **无 `dirty journal detected`**，`docker images` 仍为 8 个镜像。
+- 实测（#196 / 12G / seed 盘）：启动 → `dragon-docker-start` → `docker run redis` → `busybox poweroff -f` → 再次启动无 nested-panic，`docker images` 仍为 8 个镜像。
+- 直接取证（host，关机后 `dumpe2fs -h /dev/loopXp1`）：`Filesystem state: clean`，features 列表**不含 `needs_recovery`** ⇒ `shutdown_writable()` 确实清除了 RECOVER。
+- 说明：即使 RECOVER 已清，挂载时若日志区仍有内容，`dirty journal detected ... replaying` 仍可能出现一次（replay 为空操作，不再 panic）；判断是否干净以上面的 `dumpe2fs` 为准。
 
 ### 3.19 bash 子进程崩溃：已排除项与下一步（2026-10-24）
 - 复现矩阵（#196，干净关机可复用盘）：
