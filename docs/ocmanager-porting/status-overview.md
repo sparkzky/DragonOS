@@ -427,6 +427,13 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 结合 §3.26/§3.27：`bash` 在内核栈上位于 `do_user_addr_fault`，双 CPU idle，`virtio_blk_io_*` 与 `ext4_journal` 不可中断，但页缓存的显式等待未被命中。
 - 剩余候选（下一步逐一加探针）：① `AddressSpace` 写锁/`page_table_edit` 上的锁等待（持有者可能正阻塞在 IO）；② inode/元数据锁；③ cgroup 内存 charge 等待（`alloc-exhausted` 的同域路径）；④ `mmu_gather`/TLB 等待。
 
+### 3.29 挂死点定位：exec 的 group-exec 等待（2026-10-24 关键）
+- 新增探针（`db34ca2e`）：公共等待入口加 `#[track_caller]`，记录**用户任务**最近一次等待的 `file:line` 与 pid，由 stall dump 打印；内核线程不记录（避免覆盖）。
+- 实机挂死输出：`last wait site: src/ipc/process_signal/exec.rs:32 (pid=648)`。
+- 该行位于 `ProcessSignalState::wait_group_exec_event_killable()` —— **多线程进程 exec 时等待兄弟线程退出的 group-exec 事务**。
+- 结论（推断已很强）：容器内某个多线程进程（Go 实现的 runc/containerd-shim 等）执行 exec，需要先让所有兄弟线程退出；其中某个线程长时间不退（阻塞在 futex/不可中断 IO），exec 的等待永不返回，容器启动挂死；此前 `do_user_addr_fault`/`wake_all` 栈帧是栈扫描噪声。
+- 下一步：① 在 `start_group_exec_transaction`/完成路径打印未完成 generation 与待退出 sibling tid 列表（超时 5s 触发一次）；② 在 stall dump 中把「同 tgid 的线程」一并列出，直接看出哪个 sibling 卡住；③ 复核 exec 的 sibling 终止流程是否会让处于 uninterruptible 等待的线程被强杀/唤醒。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
