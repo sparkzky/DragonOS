@@ -643,23 +643,32 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 下一步：用 `CURRENT_PCB_DIAG` 的 owner 字段确认该栈属于哪个任务，再追该任务的 PCB 生命周期
 （为何 Strong 归零或槽被覆盖）。
 
-## 4. 独立待办与当前阻断（2026-10-23）
+## 4. 当前状态与待办（2026-10-24 刷新）
 
-| 问题 | 状态/证据 |
-|------|-----------|
-| **大镜像 `docker load` 楔死** | cp-kafka 416MB tar load 中途盘零增长、Ctrl+C 无效；mysql/redis/zk 均 `LOAD=0`。与 2-e 同域，待 dockerd.log/任务转储或逐层加载定位 |
-| **bash `<(函数)` 崩溃** | 最小复现 `f(){ :; }; cat <(f)` → 父 bash SIGSEGV；`f`、`(f)`、`$(f)`、`cat <(echo p;echo q)` 均正常；rip=0x65451（initialize_flags+0x71）、寄存器全零 |
-| **负载期时钟偏差** | watchdog：`cs=504ms` vs `wd=578ms`（kvm-clock 慢 ~13%），出现于 kafka load 期间；需用 PMTMR 交叉复测 |
-| **fault.rs:1206/1223 关中断 shootdown** | pinpoint 已取得；修法：gather 后延迟 flush / 原子区 fault 不发起同步 shootdown |
-| **容器崩溃后 `docker run` 挂起（2-e）** | docker logs/exec/inspect 挂起、dockerd 孤儿；与 load 楔死同源待查 |
-| storm 超脏 journal 重放 panic-park | 待查重放路径（本例多次复现：kill -9 后重放 park） |
-| futex_wake `nr_wake=0` 强制唤醒 1 个 | 已发现待修（Linux 语义 no-op） |
-| `is_kthread` 分类缺陷 | 已发现待修 |
-| `active_clocksource_regressed` 自旋窗 1s | 已发现待修 |
-| IRQ 独立栈（Linux IST） | 未动 |
-| 次级 syscall 缺口（AIO/fallocate/sysctl/ptrace/FAT/DAC） | AIO 已确认 mysqld 可回退；其余未动 |
-| QEMU >2G 且非 6G 启动挂死（D） | 未动，6G 绕过 |
-| Go 服务镜像构建与部署收尾 | 待 compose infra 打通后进行 |
+### 4.1 已闭环（本轮及上一轮）
+
+| 项 | 结论/证据 |
+|---|---|
+| 控制台/缺页自死锁 | 修复（`47cdb558`、`b82baac0`），§3.33/§3.34 |
+| 容器内 bash `bgpids` SIGSEGV | `RLIMIT_NPROC = max_threads/2` 修复（`22032d92`，PR #2534） |
+| Go 服务 netlink 越界 | IPv4 属性顺序修复（`d9ba239b`，PR #2536） |
+| `utime(2)` 缺失 | 实现并验证（`079e38ea`，PR #2537） |
+| 关机 RECOVER 未清 | 关机前 flush/close（`8d93771f`，PR #2541），实测 `Filesystem state: clean` |
+| 缺页 TLB shootdown 系列 | PR #2543 |
+| clocksource fallback / APIC 校准 | PR #2544（仅净增量） |
+| `is_kthread` 分类、`futex_wake nr_wake=0` | 已证伪（§3.42.3-5/6） |
+| R15 全栈与 mysql 终验 | 净盘六服务验收通过（§3.42.1b） |
+| 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
+
+### 4.2 待办（按优先级）
+
+| # | 项 | 现状与下一步 |
+|---|---|---|
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 4G 必现、12G 脏 journal 亦现；首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）；已加 `CURRENT_PCB_DIAG` + `find_task_by_stack_base`（`7359d0df`）。下一步：读 DIAG owner → 追 PCB 生命周期/槽覆盖来源 |
+| 2 | IRQ 独立栈（Linux IST） | 未开始 |
+| 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
+| 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
+| 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
