@@ -455,6 +455,42 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 解读：等待者看不到有效事务（无 GROUP_EXEC 阶段/计数已为 0，且 `weak_matches(group_exec_task, owner)` 很可能为假），因此 `group_exec_pending_complete()` 永远返回 false，killable 等待没有信号就永久睡眠。
 - 修复方向（待实现）：de_thread 的两个条件应把“事务已不活跃/已被清除”视为完成（Linux 语义：等待的是计数归零，清除时 wake 且重检应通过）；或在 `clear_group_exec_locked` 时留下“已完成”标记供等待者判定。需同时审查 `finish_group_exec_owned` / `try_cancel_group_exec` 的并发顺序。
 
+### 3.33 挂死真因一：控制台输入路径持锁打印自死锁（2026-10-24，已修复）
+
+- 取证方式：`-gdb tcp::12581` 直连 QEMU gdbstub，读两 CPU 的 `$pc/$eflags`：
+  CPU0 `rip=SpinLock<InnerVirtIOConsoleDevice>::try_lock_irqsave`、`rflags=0x6`（IF=0）自旋；
+  CPU1 `rip=virtio_console_rx_retry_tasklet::call` 的 try_lock 循环、`rflags=0x246`。
+- 结论：`pump_input()` 持有 `InnerVirtIOConsoleDevice` 锁时调用 `print_critical!`（每 256 字节）与 `dump_all_tasks()`（`D` 热键）；控制台输出路径再次取同一把锁 → 同 CPU 自死锁，且另一 CPU 的 rx tasklet 也被拖住。
+- 证据：普通命令里含大写 `D` 即触发转储并 panic（`dump_all_tasks` 对无 Pid 任务 `pid().unwrap()`）；此时任何输入都无回显。
+- 修复：删除持锁打印与 `D` 热键；转储对无 Pid 任务回退 `raw_pid`（提交 `47cdb558`、`88259651`）。
+
+### 3.34 挂死真因二：缺页路径持地址空间写锁读用户内存自死锁（2026-10-24，已修复）
+
+- 取证：per-task 等待点显示 26+ 任务停在 `fault.rs:388`（`current_address_space.write()`）；RwSem 增加持有者 pid/获取点探针后打印 `rwsem SELF-DEADLOCK: InnerAddressSpace pid=664 held_at=fault.rs:388 want_at=fault.rs:388`。
+- 根因：`No mapped vma` 诊断分支在仍持有 mmap 写锁时用 `UserBufferReader` 读 `regs.rip` 处指令与 `0x122f50`（bgpids）。目标页未映射 → 嵌套 #PF，而嵌套缺页同样先取 `write()` → 自死锁。内核访问用户地址的 `#PF` 无法靠异常表绕开，因为取锁发生在 fixup 判断之前。
+- 修复：删除该读取，仅保留不触碰用户内存的寄存器日志（提交 `b82baac0`）。
+- 排除记录：`exec` group 等待不是本次挂死点——分片 1s 超时探针从未触发（`exec wait stalled` 零输出），§3.32 的修复方向据此作废。
+
+### 3.35 容器内 bash `bgpids` SIGSEGV：RLIMIT_NPROC 默认 0（2026-10-24，已修复）
+
+- 现象：ClickHouse entrypoint 的命令替换子进程 `bash` 在 `rip=PIE+0x57ca1`（`pshash_delindex`）访问 `0x8` 崩溃，`rdi=0`（`bgpids.storage==NULL`）。
+- 归因：`ulimit -u`/`getconf CHILD_MAX` 均为 0。bash 5.2 `bgp_resize()` 在 `c_childmax==0` 时 `bgpids.nalloc < nsize_cur` 不成立 → 既不分配 storage 也不更新 nalloc；随后 `bgp_getindex()` 仍调用 `pshash_delindex(bgpids.head=0)` → `storage[0].pid` 空指针。
+- 对齐 Linux：`fork_init()` 把 init 的 `RLIMIT_NPROC` 与 `RLIMIT_SIGPENDING` 都设为 `max_threads/2`；DragonOS 只设了 Sigpending（提交 `22032d92`）。
+- 验证：`ulimit -u=12259`；`/t41.sh` 输出 `OK41`/`P41=0` 且无 `No mapped vma` 日志；`docker run -d clickhouse/clickhouse-server:23.8.8.20` 正常 Up，`clickhouse-client -q 'select 1'` 返回 1。
+
+### 3.36 本轮回归（2026-10-24）
+
+| 项目 | 结果 |
+|---|---|
+| `ulimit -u` / `getconf CHILD_MAX` | 12259 / 12259 |
+| `docker run redis:7.2.3-alpine true` | `LIGHT=0` |
+| `/t41.sh`（ClickHouse entrypoint 前 41 行） | `OK41`、`P41=0`，无 SIGSEGV |
+| ClickHouse 容器 + `select 1` | `CH=0`，输出 `1` |
+| `/cowtest 500 1` | `c0=500` |
+| `/pietest 1000` | `bad=0` |
+
+> 备注：ClickHouse 启动期间 `Fetch` 线程出现过 `BLOCK STORM`（等待点 `address_space.rs:1987` 的 `mprotect_wait` 写锁），但随后自行恢复，容器正常就绪；该非致命长等待留待后续评估。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
