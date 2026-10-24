@@ -589,8 +589,8 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 2. `/proc/net/tcp` 为空：`procfs/net` 仅注册 `arp`/`protocols`，缺 socket 全局表。
 3. IRQ 独立栈（未开始）。
 4. 次级系统调用/文件系统缺口：AIO、fallocate、sysctl、ptrace、FAT、DAC。
-5. `is_kthread` 任务分类缺陷。
-6. `futex_wake nr_wake=0`：已核对 Linux `if (++ret >= nr_wake) break;` 同样唤醒 1 个，当前实现一致，未改动（保留复核）。
+5. ~~`is_kthread` 任务分类缺陷~~（已核对，不再成立）：当前 `fork.rs:472` 由创建参数显式 `insert(KTHREAD)`（不走继承），workqueue worker 经 `KernelThreadMechanism::create_and_run` → `__inner_create(kthread=true)` 创建；`is_kthread()` 直接读该标志。若现场再出现，应在 dump 中打印该标志取证。
+6. ~~`futex_wake nr_wake=0`~~（已实测确认非缺陷）：本机 Linux 上 `FUTEX_WAKE(0)` 唤醒 1 个等待者并返回 1（内核 `if (++ret >= nr_wake) break;` 的固有行为），DragonOS 的 `effective_nr_wake = 1` 与之一致。
 7. QEMU 内存 >2G 且非 6G 时挂死（D）。
 8. R15 压测与 mysql 终验（#2495 已关闭，验证通过前不重提）。
 
