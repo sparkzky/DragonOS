@@ -28,6 +28,14 @@ const MAX_SOFTIRQ_RESTART: i32 = 20;
 
 static SOFTIRQ_VECTORS: AtomicPtr<Softirq> = AtomicPtr::new(null_mut());
 
+/// 诊断：init 时记录的 running_count 数组地址/长度，用于发现对象被改写。
+static EXPECT_RUN_PTR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static EXPECT_RUN_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static CORRUPT_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[inline(never)]
 pub fn softirq_init() -> Result<(), SystemError> {
     info!("Initializing softirq...");
@@ -40,6 +48,8 @@ pub fn softirq_init() -> Result<(), SystemError> {
         return Err(SystemError::EBUSY);
     }
     let (run_ptr, run_len) = debug_running_slots();
+    EXPECT_RUN_PTR.store(run_ptr, Ordering::Relaxed);
+    EXPECT_RUN_LEN.store(run_len, Ordering::Relaxed);
     crate::print_critical!(
         "softirq init: box={:#x} size={} running_ptr={:#x} running_len={}\n",
         softirq as usize,
@@ -239,6 +249,29 @@ impl Softirq {
 
     #[inline(never)]
     fn do_softirq(&self) {
+        // 诊断：对象一旦被外部写入（全局指针不变），立即 dump 头部 0x60 字节，
+        // 记录覆盖模式（零化 / 盘上数据 / 指针碎片）。
+        if unlikely(!CORRUPT_REPORTED.load(Ordering::Relaxed)) {
+            let (ptr, len) = self.cpu_running_count().raw_parts();
+            if ptr != EXPECT_RUN_PTR.load(Ordering::Relaxed)
+                || len != EXPECT_RUN_LEN.load(Ordering::Relaxed)
+            {
+                CORRUPT_REPORTED.store(true, Ordering::Relaxed);
+                let base = self as *const Softirq as *const u64;
+                crate::print_critical!(
+                    "SOFTIRQ CORRUPT: self={:#x} running_ptr={:#x} running_len={} expect_ptr={:#x} expect_len={}\n",
+                    base as usize,
+                    ptr,
+                    len,
+                    EXPECT_RUN_PTR.load(Ordering::Relaxed),
+                    EXPECT_RUN_LEN.load(Ordering::Relaxed)
+                );
+                for i in 0..12 {
+                    let v = unsafe { core::ptr::read_volatile(base.add(i)) };
+                    crate::print_critical!("SOFTIRQ CORRUPT: +{:#04x}={:#018x}\n", i * 8, v);
+                }
+            }
+        }
         ProcessManager::preempt_disable();
         let _preempt_guard = SoftirqPreemptGuard;
         if self.cpu_running_count().get().load(Ordering::SeqCst) >= Self::MAX_RUNNING_PER_CPU {
