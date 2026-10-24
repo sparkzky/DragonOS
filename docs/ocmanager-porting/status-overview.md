@@ -403,6 +403,16 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 影响：bash/bgpids 的现场采集被阻断；同一命令此前（#199）可完成 `P41=0`，说明为**概率性**，与镜像/命令无关。
 - 下一步优先查：① 该挂死是否为 TLB/IRQ 类死锁（可用 QEMU monitor 取两 CPU RIP，方法见 §3.11）；② `virtio_blk_io_0` 不可中断与 `ext4_journal` 阻塞是否构成完成链丢失（#2515 自检未覆盖此路径）。
 
+### 3.26 首容器挂死的直接取证：双 CPU idle + bash 不可中断（2026-10-24）
+- 现场：净盘 + seed，`dragon-docker-start` 正常，轻量容器 `docker run --rm redis:7.2.3-alpine true` → `LIGHT=0`；随后运行 41 行脚本容器时挂死。
+- QEMU monitor 取证（方法：`Ctrl-A c` → `info registers` → `cpu 1` → `info registers`）：
+  - CPU0 `RIP=ffff8000007ec059 HLT=1`，CPU1 同址 ⇒ 符号化为 **`ProcessManager::arch_idle_func`**，即两 CPU 都在 idle HLT。
+  - 结论：**不是自旋死锁**，而是没有任何可运行任务。
+- 同刻 `TASK DUMP: 76 tasks` 状态分布：`Blocked(true)=60`、`Blocked(false)=15`、`Runnable=1`（正在打印的 `stall_watchdog`）。
+- 不可中断的 15 个任务包括：`bash`（用户进程，处于不可中断睡眠）、`virtio_blk_io_0`、`virtio_blk_io_1`、`ext4_journal`、`ext4_complete`、`srcu_gp`、`rcu_gp` 等。
+- 解读（推断）：用户 `bash` 在等 BIO 完成（不可中断），两个 virtio-blk io 线程与 ext4 journal 同样停摆，说明**完成中断/唤醒链再次中断**（与阻断4同域）；由于 `submit_bio_wait` 的 1s 超时循环会在 5s 内打印 `vblk stall`，而串口 **0 条**，可进一步定位为 **未进入 `submit_bio_wait` 的等待**（更可能停在 `bio_queue.wait_for_work_or_stop()` 或 BIO 完成后的唤醒路径）。
+- 下一步：① 在 `BioQueue::submit` 与 `wait_for_work_or_stop` 之间加一次性竞态探针（记录 `queue.len/state/wake_count`）；② 在 `complete_used_requests` 末尾对 `bio.wait_status()` 的唤醒路径加计数，确认完成 BIO 是否真的唤醒等待者；③ 复核 `virtio_blk_io_1`（第二块盘 ext4disk）是否也存在同类停顿。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
