@@ -179,13 +179,27 @@ pub fn emergency_print_u64_noalloc(mut value: u64) {
     emergency_print_noalloc(s);
 }
 
+/// 零分配地输出一个 u64 的十六进制表示（`0x` 前缀，小写）。
+#[cfg(target_arch = "x86_64")]
+pub fn emergency_print_hex_noalloc(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = HEX[((value >> (60 - 4 * i)) & 0xf) as usize];
+    }
+    let s = core::str::from_utf8(&buf).unwrap_or("?");
+    emergency_print_noalloc(s);
+}
+
 /// 非 x86_64 架构暂无可用的零分配通道，退化为空实现。
 #[cfg(not(target_arch = "x86_64"))]
 pub fn emergency_print_noalloc(_s: &str) {}
 
 /// 非 x86_64 架构暂无可用的零分配通道，退化为空实现。
 #[cfg(not(target_arch = "x86_64"))]
-pub fn emergency_print_u64_noalloc(_value: u64) {}
+pub fn emergency_print_hex_noalloc(_value: u64) {}
 pub struct Logger;
 
 impl Logger {
