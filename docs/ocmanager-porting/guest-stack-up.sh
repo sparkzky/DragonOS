@@ -26,7 +26,7 @@ docker exec kfk kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/n
 for f in /migrations/footstone/*.sql; do docker exec -i mdb mysql -uroot --skip-password footstone < "$f" 2>&1 | tail -1; echo "MIG_FOOT_$f=$?"; done
 for f in /migrations/msg_etl/*.sql; do docker exec -i ch clickhouse-client --multiquery < "$f" 2>&1 | tail -1; echo "MIG_CK_$f=$?"; done
 docker run -d --name etl --network host \
- -e SERVICE=msg-etl -e KAFKA_HOST=127.0.0.1 -e KAFKA_PORT=9092 \
+ -e SERVICE=msg-etl -e JWT_SECRET=devsecret -e KAFKA_HOST=127.0.0.1 -e KAFKA_PORT=9092 \
  -e CLICKHOUSE_HOST=127.0.0.1 -e CLICKHOUSE_PORT=9000 -e CLICKHOUSE_USER=default -e CLICKHOUSE_PWD= \
  -e FOOTSTONE=ip://127.0.0.1:17778 \
  -e MSG_ETL_HTTP_PORT=8080 -e MSG_ETL_TRPC_PORT=7778 -e MSG_ETL_HEALTH_PORT=8081 \
@@ -40,6 +40,24 @@ docker run -d --name foot --network host \
  -e JWT_SECRET=devsecret -e FOOTSTONE=ip://127.0.0.1:17778 -e MSG_ETL=ip://127.0.0.1:7778 \
  -e FOOTSTONE_HTTP_PORT=21000 -e FOOTSTONE_TRPC_PORT=17778 -e FOOTSTONE_WS_PORT=21001 -e FOOTSTONE_HEALTH_PORT=21002 \
  oc-footstone:dev >/dev/null 2>&1; echo FOOT=$?
+# sysdiagnose：独立 MySQL 库（迁移需随 seed 注入 /migrations/sysdiagnose/），
+# 端口与 msg-etl 错开（host 网络下 8080/7778 已被 etl 占用）
+docker exec mdb mysql -uroot --skip-password -e 'create database if not exists sysdiagnose'
+for f in /migrations/sysdiagnose/*.sql; do
+  [ -f "$f" ] || continue
+  docker exec -i mdb mysql -uroot --skip-password sysdiagnose < "$f" 2>&1 | tail -1
+  echo "MIG_SD_$f=$?"
+done
+docker run -d --name sdiag --network host \
+ -e SERVICE=sysdiagnose -e JWT_SECRET=devsecret \
+ -e MYSQL_HOST=127.0.0.1 -e MYSQL_PORT=3306 -e MYSQL_USER=root -e MYSQL_PWD= \
+ -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=6379 -e REDIS_USER=default -e REDIS_PWD= \
+ -e CLICKHOUSE_HOST=127.0.0.1 -e CLICKHOUSE_PORT=9000 -e CLICKHOUSE_HTTP_PORT=8123 \
+ -e CLICKHOUSE_USER=default -e CLICKHOUSE_PWD= \
+ -e FOOTSTONE=ip://127.0.0.1:17778 \
+ -e TMS=http://127.0.0.1:8080 -e TMS_USER_ID=18 \
+ -e SYSDIAGNOSE_HTTP_PORT=21006 -e SYSDIAGNOSE_TRPC_PORT=21007 -e SYSDIAGNOSE_HEALTH_PORT=21008 \
+ oc-sysdiagnose:dev >/dev/null 2>&1; echo SD=$?
 sleep 30
 docker ps --format '{{.Names}} {{.Status}}'
 docker logs --tail 15 foot > /root/foot.log 2>&1

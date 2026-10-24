@@ -643,7 +643,51 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 下一步：用 `CURRENT_PCB_DIAG` 的 owner 字段确认该栈属于哪个任务，再追该任务的 PCB 生命周期
 （为何 Strong 归零或槽被覆盖）。
 
-## 4. 当前状态与待办（2026-10-24 刷新）
+## 3.44 OCManager 全栈功能验收（2026-10-25，内核 #253）
+
+净盘启动后不再只做“进程 Up + 健康检查”，而是对每条业务链路做真实 API 调用
+（镜像内无 curl/xz，用 `ch` 容器自带 `wget` 从容器内发起）。
+
+| 链路 | 请求 | 结果 |
+|---|---|---|
+| footstone 健康 | `GET :21002/health` | `200`，`{"status":"ok","service":"footstone",...}` |
+| msg-etl 健康 | `GET :8081/health` | `200`，`{"status":"ok","service":"msg-etl",...}` |
+| sysdiagnose 健康 | `GET :21008/health` | `200`，`{"status":"ok","service":"sysdiagnose",...}` |
+| 登录 | `POST :21000/trpc.ocmanager.footstone.User/IdentifyAccount`（`admin` + `SHA512("Admin123456@")`） | `200`，返回 `jwt_token`、`jwt_key=Authorization`、`roles=[超级管理员]` |
+| 鉴权查询用户 | `POST .../User/GetCurrentUser`（带 JWT） | `200`，`is_super_admin:true` |
+| 鉴权 JWT 密钥 | `POST .../User/QueryJWTSecret`（带 JWT） | `200`，`{"secret":"devsecret","head_key":"Authorization"}` |
+| 项目列表（MySQL） | `POST .../Footstone/ListProjects` | `200`，返回迁移 seed 的「默认」项目 + 分页 |
+| 指标查询（ClickHouse） | `POST :8080/...msg_etl.Metrics/ListMetricsData` `{"plugin_name":"os_monitor"}` | `200`，`success:true`（空结果集，库内暂无数据） |
+| sysdiagnose 业务（MySQL） | `POST :21006/...sysdiagnose.Project/ListGlobalCmds` | `200`，返回 seed 的内置命令列表（`tail`/`ping`/…） |
+| MySQL | `show databases` / `show tables` | footstone/msg_etl/sysdiagnose 库与表齐全 |
+| Redis | `redis-cli ping` | `PONG` |
+| ClickHouse | `clickhouse-client -q 'select 1'` | `1` |
+| Kafka | `kafka-topics.sh --list` | `__consumer_offsets`、`ocm-agent-data`、`sysinfo_collector` |
+| 内核日志 | `Unsupported syscall` / `panicked` | 4 次（membarrier/io_setup×2/quotactl，均有用户态回退）、0 次 panic |
+| 关机 | `busybox poweroff -f` | QEMU exit 0 |
+
+### 3.44.1 验收中修正的部署口径（非内核缺陷）
+
+1. **msg-etl 必须注入 `JWT_SECRET`**：`pkg/plugin/permission` 的 `loadJWTFromEnv` 在未设置时
+   会回查 `User/QueryJWTSecret`，而该 RPC 自安全整改后要求管理员上下文，内部 bootstrap 必然
+   返回 `user info not found`（code 41）。compose 通过 `env_file: config/.env` 提供该值，
+   `guest-stack-up.sh` 之前漏了，已补 `-e JWT_SECRET=devsecret`（与 footstone 一致）。
+2. **sysdiagnose 需要独立 MySQL 库**：镜像不含迁移，`create database sysdiagnose` +
+   `v1.0.0_1_init_tables.sql`（actions/cmds/action_ip_relations）后启动；
+   host 网络下 8080/7778 与 msg-etl 冲突，验收用 21006/21007/21008。
+3. **`ListMetricsData` 必须带 `plugin_name`**：空值会走 `validatedIdentifier` 返回
+   `invalid plugin name ""`（业务校验，非缺陷），有效值取自 `msg_etl` 库表名。
+4. **Kafka 日志里的 `No mapped vma ... address: 0x8` 属正常**：HotSpot 隐式空指针检查产生的
+   SIGSEGV 由 JVM 自身 handler 恢复（本次 12 次，`kafka-topics --list` 随后成功）。
+
+### 3.44.2 验收中新发现的缺口
+
+- **`docker commit` 无法导出层**：`CreateDiff` 失败于
+  `failed to get xattr for .../bin/arch: operation not permitted`（overlay/containerd diff 路径）。
+  本次因此改用原始 `docker run` 重建容器；待排查 `getxattr` 在 overlay 挂载上的 EPERM
+  是否与 §3.42.3 的 xattr 缺口同源。
+
+## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
 
@@ -658,6 +702,7 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | clocksource fallback / APIC 校准 | PR #2544（仅净增量） |
 | `is_kthread` 分类、`futex_wake nr_wake=0` | 已证伪（§3.42.3-5/6） |
 | R15 全栈与 mysql 终验 | 净盘六服务验收通过（§3.42.1b） |
+| OCManager 功能验收 | 登录/JWT、项目列表、指标查询、sysdiagnose 命令列表全部真实 API 通过（§3.44） |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
 
 ### 4.2 待办（按优先级）
@@ -669,6 +714,7 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
+| 6 | `docker commit` 导出层失败（`get xattr ... operation not permitted`） | §3.44.2；待判定是 overlay 上的 getxattr 语义缺口，还是 containerd diff 的 xattr 集合问题 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
@@ -710,6 +756,20 @@ cd tools && DRAGONOS_QEMU_MEMORY=6G ROOT_PATH=$PWD/.. bash run-qemu.sh --bios=le
 sudo losetup -fP bin/disk-image-x86_64.img
 sudo debugfs -w -R "write /tmp/xxx xxx" /dev/loop6p1
 sudo losetup -D
+
+# 迁移与脚本注入（停机状态；guest-stack-up.sh 依赖这些路径）
+#   /migrations/footstone/*.sql  /migrations/msg_etl/*.sql  /migrations/sysdiagnose/*.sql
+#   /up_ocm.sh（= docs/ocmanager-porting/guest-stack-up.sh）
+LOOP=$(sudo losetup -fP --show bin/disk-image-x86_64.img); sudo mount ${LOOP}p1 /mnt/ocm-inject
+sudo mkdir -p /mnt/ocm-inject/migrations/{footstone,msg_etl,sysdiagnose}
+# …cp 对应 SQL…
+sudo cp docs/ocmanager-porting/guest-stack-up.sh /mnt/ocm-inject/up_ocm.sh
+sudo sync && sudo umount /mnt/ocm-inject && sudo losetup -d $LOOP
+
+# 运行期向 guest 传文件（QEMU 用 slirp，10.0.2.2 即宿主机）：
+#   宿主：cd /tmp/ocm-serve && python3 -m http.server 8000 --bind 0.0.0.0
+#   guest：docker exec ch wget -q -O /tmp/x.sql http://10.0.2.2:8000/x.sql
+#   ch 镜像自带 wget（无 curl）；字符串经串口超过约 500 字符会丢字符，长逻辑写成脚本再传
 
 # 清理残留（我的 QEMU；共享服务器其他会话勿动）
 for p in $(pgrep -f 'disk-image-x86_64.img'); do sudo kill -9 $p; done
