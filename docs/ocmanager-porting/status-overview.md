@@ -559,6 +559,41 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 下一步：为内核栈加 guard page 与溢出检测并记录溢出者（与「IRQ 独立栈」合并处理），再验证脏 journal 场景。
 - 旁证：同一窗口 clocksource watchdog 报 `kvm-clock` 与 `acpi_pm` 相差 ~0.8s 并 `forcing reselection`，时间回退可能放大该路径的时序敏感性。
 
+## 3.42 自上次 PR 拆分以来的变更与当前缺口（2026-10-24）
+
+上次拆分的源基线为 `f0afd461`（见 `pr-split-2026-10-23.md`），本分支在其后新增的提交分三类：
+
+### 3.42.1 已修复（本轮上游候选，见 `pr-split-2026-10-24.md`）
+
+| 提交 | 修复 | 上游状态 |
+|---|---|---|
+| `22032d92` | 默认 `RLIMIT_NPROC = max_threads/2`（对齐 Linux `fork_init`），修复容器内 bash `bgpids` SIGSEGV | master 缺失 |
+| `d9ba239b` | netlink IPv4 地址属性顺序对齐 Linux（Go `net.Interfaces()` 越界修复） | master 仍是旧顺序 |
+| `079e38ea` | 实现 `utime(2)` | master 无该文件 |
+| `51f76477` | `run-qemu.sh` 尊重外部 `QEMU_GDB_WAIT` | master 仍硬编码 0 |
+| `da015b03` | kstack guard 映射 flush 走“有意关中断”shootdown 入口 | master 无该入口 |
+| `8d93771f` | 关机前 flush 并关闭已挂载文件系统（清 RECOVER） | master 缺失 |
+| `91d99943` | watchdog 降级判定可见（需改走 `error!`，因 master 无 critical 通道） | master 缺失 |
+| `6e28e905`+`bfa520a7`+`0f2198ef` | 缺页路径 TLB flush 系列（延迟 shootdown / 共享 helper） | master 缺失 |
+| `7fb4de4f` | clocksource fallback + APIC 重校准（部分已随 #2490 合并） | 需按差异提取 |
+
+### 3.42.2 仅本分支的脚手架/诊断（不开 PR）
+
+`b82baac0`（fault 诊断读取用户内存——该诊断代码只存在于本分支）、`47cdb558`（console 持锁打印/热键——同上）、
+`88259651`（每任务等待点）、`9413ba1d`/`f09ab924`/`34883847`（softirq 取证）。
+它们用于定位，不构成上游缺陷修复；相关根因修复已单独提交（见 3.42.1）。
+
+### 3.42.3 当前缺口（按优先级）
+
+1. **脏 journal panics**：已确定性复现；Softirq 对象被 panic 栈帧覆盖（全局不变、无 drop）；`kstack_protect` 下 2/2 正常 → 根因指向内核栈内存。剩余：定位具体溢出者/越界写，评估默认启用 guard page。
+2. `/proc/net/tcp` 为空：`procfs/net` 仅注册 `arp`/`protocols`，缺 socket 全局表。
+3. IRQ 独立栈（未开始）。
+4. 次级系统调用/文件系统缺口：AIO、fallocate、sysctl、ptrace、FAT、DAC。
+5. `is_kthread` 任务分类缺陷。
+6. `futex_wake nr_wake=0`：已核对 Linux `if (++ret >= nr_wake) break;` 同样唤醒 1 个，当前实现一致，未改动（保留复核）。
+7. QEMU 内存 >2G 且非 6G 时挂死（D）。
+8. R15 压测与 mysql 终验（#2495 已关闭，验证通过前不重提）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
