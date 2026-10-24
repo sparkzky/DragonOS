@@ -449,6 +449,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 说明：collect 与计数写入均在 signal 内锁内完成，因此“退出路径先看到 GROUP_EXEC 未设置”的窗口基本被排除；重点转向上面两条。
 - 下一步探针：给 `group_exec_notify_count` 与 `group_exec_leader_phase` 加只读查询，在 de_thread 的等待处按 1s 分片打印 `(count, phase, kill_list 长度)`，即可区分是计数不降还是 leader 阶段卡住。
 
+### 3.32 exec 等待确认为 killable 版 + 状态快照（2026-10-24）
+- 探针：在三个 group-exec 等待入口记录 `(notify_count, leader_phase)`（提交见 git log），dump 打印 `exec wait state`。
+- 实测挂死：`last wait site: src/ipc/process_signal/exec.rs:56`（`wait_group_exec_event_killable` 内的 `wait_event_killable`），同时快照为 **`notify_count=0 leader_phase=0`**。
+- 解读：等待者看不到有效事务（无 GROUP_EXEC 阶段/计数已为 0，且 `weak_matches(group_exec_task, owner)` 很可能为假），因此 `group_exec_pending_complete()` 永远返回 false，killable 等待没有信号就永久睡眠。
+- 修复方向（待实现）：de_thread 的两个条件应把“事务已不活跃/已被清除”视为完成（Linux 语义：等待的是计数归零，清除时 wake 且重检应通过）；或在 `clear_group_exec_locked` 时留下“已完成”标记供等待者判定。需同时审查 `finish_group_exec_owned` / `try_cancel_group_exec` 的并发顺序。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
