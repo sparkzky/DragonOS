@@ -521,13 +521,9 @@ impl VirtIOConsoleDevice {
             };
 
             if tty_input_target_room(&target) == 0 {
-                // 控制台积压（tty 队列满）：输入无人消费，普通字节直接丢弃，
-                // 但热键 'D' 必须放行——积压正是需要任务转储的场景。
-                while let Ok(Some(c)) = inner.device_inner.recv(false) {
-                    if c == b'D' {
-                        crate::debug::task_dump::dump_all_tasks();
-                    }
-                }
+                // 控制台积压（tty 队列满）：输入无人消费，直接丢弃积压字节，
+                // 待消费者腾出空间后由 retry tasklet 恢复接收。
+                while let Ok(Some(_)) = inner.device_inner.recv(false) {}
                 inner.input_rx_paused = true;
                 break;
             }
@@ -543,23 +539,6 @@ impl VirtIOConsoleDevice {
                     return Err(virtio_drivers_error_to_system_error(err));
                 }
             };
-
-            // R12c 取证：输入字节节流打印（前 16 字节 + 之后每 256 字节），
-            // 判 'D' 热键未触发时字节是否真的到达 pump_input。
-            static PUMP_BYTES: core::sync::atomic::AtomicU64 =
-                core::sync::atomic::AtomicU64::new(0);
-            let _n = PUMP_BYTES.fetch_add(1, Ordering::Relaxed) + 1;
-            if _n <= 16 || _n % 256 == 0 {
-                crate::print_critical!("pumpin #{_n} byte={:#x}\n", c);
-            }
-
-            // 调试热键：收到 'D'(0x44) 时无条件转储全部任务状态（关键通道）。
-            // 必须在 enqueue 之前检查：控制台积压时 tty 队列满，enqueue 失败
-            // 走 break 分支，热键将永不可达——而这恰是最需要转储的场景
-            // （dockerd B+ 阻塞取证实测触发失败）。
-            if c == b'D' {
-                crate::debug::task_dump::dump_all_tasks();
-            }
 
             if enqueue_tty_rx_to_target_from_irq(&target, &[c]) != 1 {
                 inner.input_rx_paused = true;
