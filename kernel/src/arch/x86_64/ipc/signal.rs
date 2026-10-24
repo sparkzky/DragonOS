@@ -1096,6 +1096,29 @@ impl SignalArch for X86_64SignalArch {
             }
         };
 
+        {
+            // 临时诊断：记录从用户栈读回的 ucontext 关键寄存器。
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let suspicious = ucontext.uc_mcontext.rip < 0x10000
+                || ucontext.uc_mcontext.rsp == 0
+                || (ucontext.uc_mcontext.rdi == 0
+                    && ucontext.uc_mcontext.rsi == 0
+                    && ucontext.uc_mcontext.rdx == 0);
+            if (suspicious && n < 64) || n < 4 {
+                crate::print_critical!(
+                    "sigret: pid={} rip={:#x} rsp={:#x} rdi={:#x} rax={:#x} frame={:#x}\n",
+                    ProcessManager::current_pcb().raw_pid().data(),
+                    ucontext.uc_mcontext.rip,
+                    ucontext.uc_mcontext.rsp,
+                    ucontext.uc_mcontext.rdi,
+                    ucontext.uc_mcontext.rax,
+                    frame_ptr as usize
+                );
+            }
+        }
+
         // Align with Linux restore_sigcontext(): after a signal handler returns, any pending
         // restart block should degrade to no-restart state. Subsequent manual calls to
         // restart_syscall should only get EINTR and must not continue consuming the old restart context.
@@ -1274,6 +1297,26 @@ fn setup_frame(
     let mut archinfo_guard = pcb.arch_info_irqsave();
     let cr2 = *archinfo_guard.cr2_mut() as u64;
     let user_ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2, &sig_altstack);
+    {
+        // 临时诊断：记录信号投递时写入 ucontext 的关键寄存器。
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let suspicious = trap_frame.rip < 0x10000
+            && trap_frame.rsp == 0
+            || (trap_frame.rdi == 0 && trap_frame.rsi == 0 && trap_frame.rdx == 0);
+        if (suspicious && n < 64) || n < 4 {
+            crate::print_critical!(
+                "sigsetup: pid={} sig={:?} rip={:#x} rsp={:#x} rdi={:#x} rax={:#x}\n",
+                ProcessManager::current_pcb().raw_pid().data(),
+                sig,
+                trap_frame.rip,
+                trap_frame.rsp,
+                trap_frame.rdi,
+                trap_frame.rax
+            );
+        }
+    }
 
     // 2. 保存 FP 状态到 PCB，并准备用户态 XSAVE 数据
     archinfo_guard.save_fp_state();
