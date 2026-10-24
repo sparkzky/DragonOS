@@ -421,6 +421,12 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 结合 §3.26（双 CPU idle、两个 virtio-blk io 线程与 ext4 journal 均不可中断）：`bash` 在**文件页缺页**路径等待页缓存/BIO 完成，而完成链没有把它唤醒。
 - 下一步（精确）：① 在页缓存读路径（`read_page`/`wait_on_page`）加 waiter 计数与一次性超时打印（与 `VBLK_*` 计数并列），区分“BIO 未提交 / 已提交未完成 / 已完成未唤醒”；② 在 `complete_used_requests` 末尾打印 `used_idx` 与 `last_used_idx`，确认是否还有未回收的 used 项；③ 两个 io 线程（disk 与 ext4disk）分别统计，排除第二块盘干扰。
 
+### 3.28 页缓存等待点排除（2026-10-24）
+- 为 `PageCacheReadBatch::wait()` 与 `PageEntry::wait_ready()` 增加 1s 分片等待 + 停滞打印（语义不变，循环直到条件满足）。
+- 复现挂死后：`pcache stall` **0 条** ⇒ 阻塞点既不在读批完成，也不在 Loading 页等待。
+- 结合 §3.26/§3.27：`bash` 在内核栈上位于 `do_user_addr_fault`，双 CPU idle，`virtio_blk_io_*` 与 `ext4_journal` 不可中断，但页缓存的显式等待未被命中。
+- 剩余候选（下一步逐一加探针）：① `AddressSpace` 写锁/`page_table_edit` 上的锁等待（持有者可能正阻塞在 IO）；② inode/元数据锁；③ cgroup 内存 charge 等待（`alloc-exhausted` 的同域路径）；④ `mmu_gather`/TLB 等待。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
