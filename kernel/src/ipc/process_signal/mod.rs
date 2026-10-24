@@ -1,6 +1,6 @@
 //! Thread-group signal identity and lifecycle, shared only by CLONE_THREAD.
 mod cpu_time;
-mod exec;
+pub(crate) mod exec;
 mod job_control;
 mod pending;
 

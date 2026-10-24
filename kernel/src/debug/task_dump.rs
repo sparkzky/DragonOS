@@ -144,6 +144,14 @@ pub(crate) fn dump_all_tasks() {
         use core::sync::atomic::Ordering as O;
         let file_ptr = crate::libs::wait_queue::LAST_WAIT_SITE_FILE.load(O::Relaxed);
         let len = crate::libs::wait_queue::LAST_WAIT_SITE_LEN.load(O::Relaxed);
+        let ec = crate::ipc::process_signal::exec::EXEC_WAIT_COUNT.load(O::Relaxed);
+        if ec >= 0 {
+            crate::println_critical!(
+                "exec wait state: notify_count={} leader_phase={}\n",
+                ec,
+                crate::ipc::process_signal::exec::EXEC_WAIT_PHASE.load(O::Relaxed)
+            );
+        }
         if !file_ptr.is_null() && len > 0 {
             let bytes = unsafe { core::slice::from_raw_parts(file_ptr, len) };
             let file = core::str::from_utf8(bytes).unwrap_or("<invalid>");

@@ -1,6 +1,28 @@
 //! Exec handoff and wait transactions.
 use super::*;
 
+
+/// 诊断：最近一次 exec group 等待时的 (notify_count, leader_phase)。
+/// 0=无, 1=Pending, 2=Exiting, 3=Ready；dump 时打印以区分“计数不降”与“leader 卡住”。
+pub static EXEC_WAIT_COUNT: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(-1);
+pub static EXEC_WAIT_PHASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+impl ProcessSignalState {
+    fn record_exec_wait_state(&self) {
+        use core::sync::atomic::Ordering;
+        let g = self.inner();
+        let phase = match g.group_exec_leader_phase {
+            None => 0u8,
+            Some(GroupExecLeaderPhase::Pending) => 1,
+            Some(GroupExecLeaderPhase::Exiting) => 2,
+            Some(GroupExecLeaderPhase::Ready) => 3,
+        };
+        EXEC_WAIT_COUNT.store(g.group_exec_notify_count as i32, Ordering::Relaxed);
+        EXEC_WAIT_PHASE.store(phase, Ordering::Relaxed);
+    }
+}
+
 impl ProcessSignalState {
     fn group_exec_wait_queue(&self) -> &WaitQueue {
         &self.body.group_exec_wait_queue
@@ -15,6 +37,7 @@ impl ProcessSignalState {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        self.record_exec_wait_state();
         self.group_exec_wait_queue()
             .wait_event_interruptible(cond, before_sleep)
     }
@@ -28,6 +51,7 @@ impl ProcessSignalState {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        self.record_exec_wait_state();
         self.group_exec_wait_queue()
             .wait_event_killable(cond, before_sleep)
     }
@@ -41,6 +65,27 @@ impl ProcessSignalState {
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        self.record_exec_wait_state();
+        // 诊断：不可中断的 handoff 等待一旦进入就很难再观测。这里在入口打印
+        // “事务是否属于当前 owner / 计数 / 阶段”，持续超过 5 次说明卡死。
+        {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                let owner = crate::process::ProcessManager::current_pcb();
+                let g = self.inner();
+                let matched = Self::weak_matches(&g.group_exec_task, &owner);
+                crate::print_critical!(
+                    "exec uninterruptible wait: pid={} matched={} count={} phase={:?} flags_exec={}\n",
+                    owner.raw_pid().data(),
+                    matched,
+                    g.group_exec_notify_count,
+                    g.group_exec_leader_phase,
+                    g.flags.contains(SignalFlags::GROUP_EXEC)
+                );
+            }
+        }
         self.group_exec_wait_queue()
             .wait_event_uninterruptible(cond, before_sleep)
     }
