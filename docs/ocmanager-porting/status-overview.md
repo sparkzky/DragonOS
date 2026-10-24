@@ -13,6 +13,10 @@
 
 **关机不再产生脏 journal**：新增 `shutdown_mounted_filesystems()`（sync + `on_umount` 清 RECOVER），实测重启无 `dirty journal detected`，磁盘可反复复用。
 
+**主线 PR 状态（2026-10-24 `gh` 复核）**：上一轮 14 个 PR → 合并 **7**（#2484/#2490/#2493/#2507/#2509/#2512/#2515）、关闭 **3**（#2491 纯诊断、#2492 已被 `resched_current` 覆盖、#2510 panic 路径不安全并拆出 #2519 已合并 + #2518 open）、待处理 **4**（#2508 无 review；#2511/#2513/#2514 changes requested）。**关闭项未造成迁移能力回退**；明细与覆盖缺口见 `pr-split-2026-10-23.md` 的「2026-10-24 PR 状态复核」。
+
+拆分之后的本地新修复（`mm/fault.rs` 延迟 shootdown、`vfs` 关机收尾、clocksource 回归检测）**不在该轮审计范围**，待下一轮单独拆 PR。
+
 当前待解（按优先级）：
 1. **bash 子进程上下文损坏**：容器内完整 `/entrypoint.sh` 触发 SIGSEGV（`rip=0x67ca1, addr=0x8, 全零寄存器`），阻塞 ClickHouse 与 footstone 部署；
 2. **时钟钳制窗口过小**：`wdt unstable cs=504000000 (jiffies) wd=644015370 (acpi_pm)`，单次 delta 被钳在 504ms，长停顿会丢时间并触发降频；
