@@ -777,6 +777,34 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 （CPU0 一直等应答）。这与 §3.42.1 中“shootdown 调用者需合并、避免嵌套”的结论一致，
 但当前实现仍有可复现的缺口。
 
+### 3.46.1 根因（反汇编确证）
+
+- CPU0 停在 `flush_tlb_multi+994`：`pause; movzbl 0x18(%r12),%edx; … jne`——轮询目标
+  CPU 的 CSD `done` 标志（等待 ack）。
+- CPU1 停在 `flush_tlb_kernel_range_inner+0x40`：`pause; call <SpinLock<()>::try_lock>;
+  cmp; je`——即**在关中断上下文中自旋争用 `FLUSH_TLB_GLOBAL_LOCK`**。
+
+死锁链：
+
+```
+CPU0: 持 FLUSH_TLB_GLOBAL_LOCK → 发 IPI 给 CPU1 → 关中断轮询 ack
+CPU1: 关中断 → 调 flush_tlb_kernel_range_inner → 阻塞在 FLUSH_TLB_GLOBAL_LOCK
+      ⇒ 无法进入 IPI handler 执行 invlpg/ack ⇒ CPU0 永远等待
+```
+
+即：**两个 IRQ-off 发起者互等对方的 IPI 应答**。这是通用缺陷（`flush_tlb_kernel_range`
+在关中断路径都会被调用），guard page 只是把频次放大到必现。
+
+### 3.46.2 修复方向（未实施）
+
+1. **关中断上下文禁止同步 shootdown**：`flush_tlb_kernel_range` 在 IF=0 时只做本地
+   `invlpg`，把区间挂到 per-CPU pending 队列，在安全点（IRQ 开启、返回用户、idle）
+   统一做远程 flush；
+2. 被延迟的区间在被其他 CPU 看到之前不得复用（沿用 `mmu_gather` 的
+   `free_after_flush` 语义把物理页隔离）；
+3. 也可参考 per-initiator CSD 池消除全局锁，但**单独去掉锁不能解决互等**（两个
+   IRQ-off 发起者仍会互等），必须先解决第 1 条。
+
 结论：
 
 1. `kstack_protect` **不改为默认开启**，保持 `kernel/Cargo.toml` 中默认关闭；
