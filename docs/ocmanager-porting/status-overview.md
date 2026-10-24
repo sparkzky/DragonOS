@@ -577,6 +577,20 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | `6e28e905`+`bfa520a7`+`0f2198ef` | 缺页路径 TLB flush 系列（延迟 shootdown / 共享 helper） | **PR #2543** |
 | `7fb4de4f` | clocksource fallback + APIC 重校准（部分已随 #2490 合并） | **PR #2544**（仅净增量） |
 
+### 3.42.1b 净盘全栈验收（2026-10-24，内核 #249）
+
+同一净盘（seed + 迁移 + `/up_ocm.sh`）完整复跑：
+
+| 项目 | 结果 |
+|---|---|
+| `dragon-docker-start` + 六容器 | mdb / rds / ch / kfk / foot / etl 全部 Up |
+| MySQL | `mysqladmin ping` → `mysqld is alive`（RC=0），`select 1` 正常 |
+| footstone | 21000 → `HTTP/1.0 200 OK` |
+| 迁移 | footstone 4 个、msg-etl 2 个全部 RC=0 |
+| `USER BLOCK STORM` | 1 次（ClickHouse 启动期瞬时，随后自行恢复） |
+| `SOFTIRQ CORRUPT` / `nested-panic` / `Kernel code at` | 0 |
+| 关机 | `busybox poweroff -f` 后 `Filesystem state: clean`、无 `needs_recovery` |
+
 ### 3.42.2 仅本分支的脚手架/诊断（不开 PR）
 
 `b82baac0`（fault 诊断读取用户内存——该诊断代码只存在于本分支）、`47cdb558`（console 持锁打印/热键——同上）、
