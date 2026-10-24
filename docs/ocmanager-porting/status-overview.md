@@ -413,6 +413,14 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 解读（推断）：用户 `bash` 在等 BIO 完成（不可中断），两个 virtio-blk io 线程与 ext4 journal 同样停摆，说明**完成中断/唤醒链再次中断**（与阻断4同域）；由于 `submit_bio_wait` 的 1s 超时循环会在 5s 内打印 `vblk stall`，而串口 **0 条**，可进一步定位为 **未进入 `submit_bio_wait` 的等待**（更可能停在 `bio_queue.wait_for_work_or_stop()` 或 BIO 完成后的唤醒路径）。
 - 下一步：① 在 `BioQueue::submit` 与 `wait_for_work_or_stop` 之间加一次性竞态探针（记录 `queue.len/state/wake_count`）；② 在 `complete_used_requests` 末尾对 `bio.wait_status()` 的唤醒路径加计数，确认完成 BIO 是否真的唤醒等待者；③ 复核 `virtio_blk_io_1`（第二块盘 ext4disk）是否也存在同类停顿。
 
+### 3.27 挂死根因指向页缓存缺页 IO（2026-10-24 栈符号化）
+- 阻塞 `bash`(pid 729) 的转储行：`state=Blocked(false) rip=0x67ca1 LSYSCALL=13 rdi=rsi=rdx=0`。
+- 内核栈符号化（`addr2line`，由浅到深）：
+  `do_page_fault` → `X86_64MMArch::do_user_addr_fault` → … → `rcu::user_exit/user_enter` → `ProcessManager::switch_finish_hook`。
+  未见 `submit_bio_wait` 帧，且串口 **0 条 `vblk stall`** ⇒ 阻塞点不在 `submit_bio_wait` 的 1s 超时循环。
+- 结合 §3.26（双 CPU idle、两个 virtio-blk io 线程与 ext4 journal 均不可中断）：`bash` 在**文件页缺页**路径等待页缓存/BIO 完成，而完成链没有把它唤醒。
+- 下一步（精确）：① 在页缓存读路径（`read_page`/`wait_on_page`）加 waiter 计数与一次性超时打印（与 `VBLK_*` 计数并列），区分“BIO 未提交 / 已提交未完成 / 已完成未唤醒”；② 在 `complete_used_requests` 末尾打印 `used_idx` 与 `last_used_idx`，确认是否还有未回收的 used 项；③ 两个 io 线程（disk 与 ext4disk）分别统计，排除第二块盘干扰。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
