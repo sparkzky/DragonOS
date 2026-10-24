@@ -178,14 +178,48 @@ pub(crate) fn dump_all_tasks() {
         let state = pcb.sched_info().state();
         // 打印 tgid：exec 的 group-exec 等待需要兄弟线程退出，按 tgid 分组
         // 可直接看出哪个进程组卡住。
-        let tgid = pcb.task_tgid_vnr().map(|p| p.data()).unwrap_or(0);
+        // 无 Pid 身份的任务（如尚未完成 exit 解挂的线程）不能走
+        // active_pid_ns()，否则 pid() 的 unwrap 会 panic。
+        let tgid = if pcb
+            .task_pid_ptr(crate::process::pid::PidType::PID)
+            .is_some()
+        {
+            pcb.task_tgid_vnr().map(|p| p.data()).unwrap_or(0)
+        } else {
+            pcb.raw_pid().data()
+        };
+        let ppid = pcb
+            .real_parent_pcb()
+            .map(|p| p.raw_pid().data())
+            .unwrap_or(0);
         println_critical!(
-            "[pid {:>6}] tgid {:>6} {:<16} state={:?}",
+            "[pid {:>6}] tgid {:>6} ppid {:>6} {:<16} state={:?}",
             pcb.raw_pid().data(),
             tgid,
+            ppid,
             pcb.basic().name(),
             state
         );
+        // 所有 Blocked 任务（含内核线程）都打印最近等待点，便于定位
+        // 跨线程的锁/等待依赖链。
+        if matches!(state, crate::process::ProcessState::Blocked(_))
+            && pcb.basic().name() != "idle"
+        {
+            let wp = pcb.last_wait_file.load(Ordering::Relaxed);
+            let wl = pcb.last_wait_line.load(Ordering::Relaxed);
+            let wlen = pcb.last_wait_len.load(Ordering::Relaxed);
+            if !wp.is_null() && wlen > 0 && wlen < 200 {
+                let bytes = unsafe { core::slice::from_raw_parts(wp, wlen) };
+                let file = core::str::from_utf8(bytes).unwrap_or("<invalid>");
+                println_critical!(
+                    "[pid {:>6}] {:<16} wait={}:{}",
+                    pcb.raw_pid().data(),
+                    pcb.basic().name(),
+                    file,
+                    wl
+                );
+            }
+        }
         // 用户态 Blocked 任务：打印其内核栈顶 TrapFrame 的关键寄存器，
         // 离线用 nm 反解符号定位卡死的系统调用路径（dockerd B+ 取证）。
         if matches!(state, crate::process::ProcessState::Blocked(_))

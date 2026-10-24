@@ -159,6 +159,10 @@ pub struct ProcessControlBlockData {
     /// 最近一次进入的系统调用号（syscall 入口记录，供任务转储取证；
     /// Go 运行时的 SIGURG 抢占会重建内核栈顶 TrapFrame，栈帧法不可靠）。
     pub(crate) last_syscall: AtomicU64,
+    /// 诊断：最近一次公共等待入口的调用点（文件指针 + 行号），供任务转储取证。
+    pub(crate) last_wait_file: core::sync::atomic::AtomicPtr<u8>,
+    pub(crate) last_wait_line: AtomicUsize,
+    pub(crate) last_wait_len: AtomicUsize,
     pub(crate) memory_high_debt: AtomicU64,
     pub(crate) memory_high_wait: SpinLock<Option<Arc<crate::cgroup::memory::high::HighWait>>>,
     /// Temporary stacked-I/O allocation ownership, not cgroup membership.
@@ -896,6 +900,9 @@ impl ProcessControlBlock {
                 task_cgroup: RwLock::new(task_cgroup),
                 cpu_accounting: SpinLock::new(cpu_accounting),
                 last_syscall: AtomicU64::new(0),
+                last_wait_file: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                last_wait_line: AtomicUsize::new(0),
+                last_wait_len: AtomicUsize::new(0),
                 memory_high_debt: AtomicU64::new(0),
                 memory_io_context: SpinLock::new(None),
                 freezer: crate::cgroup::freezer::TaskState::default(),

@@ -122,6 +122,7 @@ impl<T: ?Sized> RwSem<T> {
             return guard;
         }
 
+        crate::libs::wait_queue::record_wait_site(core::panic::Location::caller());
         self.wait_read(false).unwrap()
     }
 
@@ -137,6 +138,7 @@ impl<T: ?Sized> RwSem<T> {
             }
         }
 
+        crate::libs::wait_queue::record_wait_site(core::panic::Location::caller());
         self.wait_write(false).unwrap()
     }
 

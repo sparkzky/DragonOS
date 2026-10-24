@@ -97,8 +97,13 @@ pub static LAST_WAIT_SITE_PID: core::sync::atomic::AtomicI32 = core::sync::atomi
 
 #[inline]
 pub(crate) fn record_wait_site(loc: &'static core::panic::Location<'static>) {
-    // 仅记录用户任务的等待点：内核线程长期等待会覆盖掉真正的现场。
+    // 每个任务都记录（内核线程的等待点同样必要）；全局“最近等待点”
+    // 只记录用户任务，避免内核线程的长期等待覆盖真正的现场。
     let pcb = crate::process::ProcessManager::current_pcb();
+    pcb.last_wait_file
+        .store(loc.file().as_ptr() as *mut u8, Ordering::Relaxed);
+    pcb.last_wait_line.store(loc.line() as usize, Ordering::Relaxed);
+    pcb.last_wait_len.store(loc.file().len(), Ordering::Relaxed);
     if pcb
         .flags()
         .contains(crate::process::ProcessFlags::KTHREAD)
