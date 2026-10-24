@@ -591,6 +591,9 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 | `SOFTIRQ CORRUPT` / `nested-panic` / `Kernel code at` | 0 |
 | 关机 | `busybox poweroff -f` 后 `Filesystem state: clean`、无 `needs_recovery` |
 
+说明：#2495 已由用户关闭且不再重提；原计划的“多轮 futex_stress2 统计”未复跑（镜像未内置该二进制），
+以本表的全栈验收（含 MySQL 终验）作为替代证据。
+
 ### 3.42.2 仅本分支的脚手架/诊断（不开 PR）
 
 `b82baac0`（fault 诊断读取用户内存——该诊断代码只存在于本分支）、`47cdb558`（console 持锁打印/热键——同上）、
