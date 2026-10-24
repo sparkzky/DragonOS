@@ -725,6 +725,39 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 `docker run --rm --entrypoint sh ctest:one -c 'ls -l /bin/arch'` 输出
 `/bin/arch -> /bin/busybox`（RC=0）。同一操作在修复前稳定失败。
 
+## 3.45 中断独立栈（IST）：#DF 独立栈上线（2026-10-25，`8f6156c9`）
+
+**动机**：任务栈不可用（栈溢出、栈指针被写坏——正是 §3.43 内存破坏类故障的形态）时，
+原 `do_double_fault` 会在同一个坏栈上 `error!` + `panic!`，随后打印路径再次取栈/取
+`current_pcb`，最终三重错误复位，现场全丢。
+
+**实现（对齐 Linux 的 IST 机制）**：
+
+| 项 | 内容 |
+|---|---|
+| 栈 | 每 CPU 16 KiB 双重错误栈，`.bss` 静态分配、16 字节对齐（`interrupt::ist`） |
+| TSS | BSP（`set_current_core_tss`）与 AP（`smp_ap_start_stage1`）都写 `IST[0]` |
+| IDT | 向量 8（#DF）的门改为 `ist=1`（描述符 IST 字段 1 对应 TSS `IST[0]`） |
+| 处理器 | 只用 `emergency_print_*`（COM1，零分配）打印 err/rsp/rip，然后 `cli; hlt` |
+| 新增设施 | `printk::emergency_print_hex_noalloc`（零分配十六进制） |
+
+注意：IST 栈底没有 PCB 槽，`current_pcb()` 在 IST 上必然无效，因此该处理器**不能**调用
+`log!`/`panic!`/任何分配；这与 §3.43.4 的“失败路径不得依赖 current_pcb”是同一约束。
+
+**验证**（内核 #258，12G）：
+
+1. gdb 读实机状态：`TSS.ist[0]=0xffff800001a69000`；IDT 门 8 的 `d0` 中 IST 字段 = 1。
+2. 故障注入：把两个 CPU 的 `TSS.RSP0` 清零，再让 shell 执行 `while true; do :; done`
+   （保持在 ring3），下一次定时中断的 ring3→ring0 栈切换失败：
+   ```
+   [#DF] double fault (IST): err=0x0 rsp=0x6ffff09ff7d0 rip=0x4561c0 -- halted
+   ```
+   串口拿到完整现场，且**没有**三重错误复位——证明 #DF 确实在独立栈上执行。
+3. 正常路径回归：同一内核正常启动到 console，`docker`/服务未受影响（§3.44 的验收环境）。
+
+**后续**：Linux 还把 NMI / #MC 放在 IST 上；本仓库目前只有 #DF。NMI 处理器若需迁到 IST，
+必须先解决它现在依赖 `current_pcb()` 的问题（同样只能用零分配通道或 per-CPU current）。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -742,6 +775,7 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 | R15 全栈与 mysql 终验 | 净盘六服务验收通过（§3.42.1b） |
 | OCManager 功能验收 | 登录/JWT、项目列表、指标查询、sysdiagnose 命令列表全部真实 API 通过（§3.44） |
 | `docker commit` 导出层失败 | ext4 符号链接 xattr 读取改为 ENODATA（`8ca49350`，§3.44.2），净盘提交+运行验证通过 |
+| IRQ 独立栈（#DF） | 每 CPU IST 栈 + 门 8 `ist=1` + 零分配停机（`8f6156c9`，§3.45），故障注入验证无三重错误 |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
 
 ### 4.2 待办（按优先级）
@@ -749,7 +783,7 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 | # | 项 | 现状与下一步 |
 |---|---|---|
 | 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 首个 panic 为 `current_pcb weak upgrade failed`（日志路径调 `current_pcb`，栈底槽无效）。2026-10-25 复现尝试为负：净盘 4G、以及 4G 下提交中被 SIGKILL 的脏盘均正常启动（§3.43.4），历史复现镜像已 clean。失败路径已改为无锁落盘 + 单层 owner 反查，下次命中可直接读 `CURRENT_PCB_DIAG`。下一步：先构造含孤儿 inode 的脏盘复现，再读 DIAG owner 追 PCB 生命周期 |
-| 2 | IRQ 独立栈（Linux IST） | 未开始 |
+| 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
