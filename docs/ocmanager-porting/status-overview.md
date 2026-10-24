@@ -364,6 +364,13 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 结论（推断）：触发条件依赖 `clickhouse extract-from-config` 子进程（jemalloc/mmap 重负载）与进程替换的时序；日志中的全零寄存器很可能是**二次故障**（SIGSEGV 处理/重试路径）的帧，首个故障未被现有日志捕获。
 - 下一步：① 在 `setup_frame()` 与 `sys_rt_sigreturn()` 各加一次性采样（sig、frame.rip/rsp/rdi、ucontext 读回值），判断是投递还是恢复阶段被清零；② 或在 user #PF 入口加 per-pid 环形缓冲（记录首个故障的 rip/addr/regs），崩溃后再打印。
 
+### 3.21 bash 子进程崩溃：信号帧排除（2026-10-24 探针实测）
+- 探针（`7ce65e24`）：在 `setup_frame()` 与 `sys_rt_sigreturn()` 对**可疑帧**（rip<0x10000、rsp=0 或 rdi/rsi/rdx 全 0）采样打印。
+- 结果：
+  - SIGCHLD 帧往返完全一致（`sigsetup rip=0x4cefc7 rsp=0x6ffff09ff758 rdi=-1` ↔ `sigret` 同值），**信号帧构造/恢复未损坏**；
+  - 复现容器 41 行前缀时出现 `pid=577 (bash) No mapped vma, rip=0x67ca1, address=0x8, rdi=rsi=rdx=0`，但**没有任何 sigsetup 记录** ⇒ 该 bash 子进程未安装 SIGSEGV handler，按默认动作终止，不是 handler 二次故障。
+- 推论：全零寄存器就是**故障现场本身**；`rip=0x67ca1` 处指令为 `xor %eax,%eax`，与 `address=0x8` 不匹配，说明要么 trap frame 的 rip 不可靠（需打印 rip 处指令字节核对），要么该 rip 属于另一个（已被 exec/覆盖的）映像。下一步：在日志中同时输出 `cs/ss/rflags/old_rsp` 与 rip 处前 8 字节指令（经页表转换读取，避免二次缺页）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
