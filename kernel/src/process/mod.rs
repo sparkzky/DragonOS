@@ -36,6 +36,7 @@ use core::sync::atomic::AtomicUsize;
 mod info;
 mod kstack;
 mod manager;
+pub(crate) use manager::find_task_by_stack_base;
 mod sched_info;
 mod state;
 mod task;

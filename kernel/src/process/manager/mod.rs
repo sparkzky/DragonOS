@@ -54,6 +54,24 @@ fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlB
     &ALL_PROCESS
 }
 
+/// 诊断：按内核栈起始地址反查任务，返回 (pid, 1=kernel_stack / 2=syscall_stack)。
+///
+/// 仅供 `arch_current_pcb()` 的失败路径使用：那里已经无法安全打印，
+/// 只返回身份，由调用者拼进 panic 消息。
+pub(crate) fn find_task_by_stack_base(base: usize) -> Option<(RawPid, u8)> {
+    let all = all_process().lock_irqsave();
+    let map = all.as_ref()?;
+    for (pid, pcb) in map.iter() {
+        if pcb.kernel_stack.read().start_address().data() == base {
+            return Some((*pid, 1));
+        }
+        if pcb.syscall_stack.read().start_address().data() == base {
+            return Some((*pid, 2));
+        }
+    }
+    None
+}
+
 /// Clone the published `Arc` of every known task, without holding the registry
 /// lock across the caller's real work.
 ///

@@ -585,6 +585,29 @@ impl ArchPCBInfo {
     }
 }
 
+/// 诊断：`arch_current_pcb()` 失败瞬间的现场（base/slot/owner_pid/kind/rsp）。
+/// 失败时通常正持有 console 锁，无法可靠打印，故落盘到静态变量供 gdb 读取。
+#[unsafe(no_mangle)]
+pub static CURRENT_PCB_DIAG: [core::sync::atomic::AtomicU64; 6] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+fn record_current_pcb_diag(base: usize, slot: usize, rsp: usize) {
+    use core::sync::atomic::Ordering;
+    let owner = crate::process::find_task_by_stack_base(base);
+    CURRENT_PCB_DIAG[0].store(base as u64, Ordering::Relaxed);
+    CURRENT_PCB_DIAG[1].store(slot as u64, Ordering::Relaxed);
+    CURRENT_PCB_DIAG[2].store(owner.map(|(pid, _)| pid.data() as u64).unwrap_or(u64::MAX), Ordering::Relaxed);
+    CURRENT_PCB_DIAG[3].store(owner.map(|(_, kind)| kind as u64).unwrap_or(0), Ordering::Relaxed);
+    CURRENT_PCB_DIAG[4].store(rsp as u64, Ordering::Relaxed);
+    CURRENT_PCB_DIAG[5].store(0x5a5a_5a5a, Ordering::Relaxed);
+}
+
 impl ProcessControlBlock {
     /// 获取当前进程的pcb
     pub fn arch_current_pcb() -> Arc<Self> {
@@ -597,8 +620,14 @@ impl ProcessControlBlock {
         let p = stack_base.data() as *const *const ProcessControlBlock;
         let slot = unsafe { *p };
         if unlikely(slot.is_null()) {
+            record_current_pcb_diag(stack_base.data(), 0, ptr.data());
             error!("p={:p}", p);
-            panic!("current_pcb is null");
+            let owner = crate::process::find_task_by_stack_base(stack_base.data());
+            panic!(
+                "current_pcb is null: stack_base={:#x} owner={:?}",
+                stack_base.data(),
+                owner
+            );
         }
         // 栈底 PCB 槽被写坏时（历史样本：errno -15、布尔 0x1、以及形如
         // 附近内核指针截断的 0x1c01d6023），先转储栈底 32 字节再判型：
@@ -635,9 +664,22 @@ impl ProcessControlBlock {
             let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
                 ManuallyDrop::new(Weak::from_raw(slot));
 
-            let new_arc: Arc<ProcessControlBlock> = weak_wrapper
-                .upgrade()
-                .expect("current_pcb weak upgrade failed (pcb freed?)");
+            let new_arc: Arc<ProcessControlBlock> = match weak_wrapper.upgrade() {
+                Some(arc) => arc,
+                None => {
+                    // 失败路径无法安全打印（当前可能正持有 console 锁），把
+                    // 现场写入静态变量，供 gdb 读取。
+                    record_current_pcb_diag(stack_base.data(), slot as usize, ptr.data());
+                    let owner =
+                        crate::process::find_task_by_stack_base(stack_base.data());
+                    panic!(
+                        "current_pcb weak upgrade failed (pcb freed?): stack_base={:#x} slot={:#x} owner={:?}",
+                        stack_base.data(),
+                        slot as usize,
+                        owner
+                    );
+                }
+            };
             return new_arc;
         }
     }
