@@ -3442,7 +3442,11 @@ impl IndexNode for LockedExt4Inode {
             .ftype
             == FileType::SymLink
         {
-            return Err(SystemError::EPERM);
+            // Linux 语义（实测 ext4）：符号链接不承载扩展属性，读取时
+            // VFS 把 -EOPNOTSUPP 归一为 -ENODATA（含 security.*/user.*/trusted.*）。
+            // 返回 EPERM 会让 containerd 的 diff 导出直接失败（docker commit），
+            // 而写入路径仍按 Linux 由 xattr_permission 拒绝为 EPERM。
+            return Err(SystemError::ENODATA);
         }
 
         // 调用another_ext4库的getxattr接口
