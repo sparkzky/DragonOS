@@ -383,6 +383,15 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
   1. 验证子进程数据段：在子 shell 中打印已知全局（如 `BASH_VERSINFO`）与普通变量，确认是否出现“数据页被清零”；若是，则回到 COW/fork 数据页复制路径（与我们近期改动的 `do_wp_page` 相关）。
   2. 若仅 `bgpids` 为 NULL，则查 bash 何时分配该表（`initialize_job_control`/`get_pid_stats`）并确认是否在 fork 早于初始化时被调用。
 
+### 3.23 bash 崩溃：排除内核数据损坏（2026-10-24 对照实验）
+- **修正前一轮误报**：`cowtest` 首版断言索引写错（`buf[8]` 实为 `'-'`），导致“3000 次 fork 全 bad”。修正断言后：
+  - `/cowtest 500 0`（只读继承）→ `c0=500`；`/cowtest 500 1`（COW 写后再校验）→ `c0=500`；均 RC=0。
+  - `/pietest 1000`（PIE + `R_X86_64_RELATIVE` 全局指针 + COW 写）→ `bad=0`。
+  ⇒ **fork / COW / 重定位数据继承在 DragonOS 上均正常**，排除“子进程数据页被清零 / 重定位丢失”。
+- bash 5.2 源码核对（`jobs.c`）：`struct bgpids bgpids = {0,0,0,0}`，`storage` 惰性分配；崩溃指令读的是 `bgpids.storage[idx].status`（偏移 8），`storage==NULL` 时即访问 `0x8`。多数读取路径都有 `storage == 0` 守卫，个别内部路径（如 `pshash_delindex`/复用槽位）依赖调用方先 `bgp_resize`。
+- 结论（推断）：这是 bash 在**子 shell 的 job-control 状态未就绪**时进入 pid 状态表读取的时序问题；DragonOS 侧只影响该路径的触发概率（如 SIGCHLD 投递时机），非内核数据损坏。
+- 下一步：① 用 `gdb`/kprobe 在崩溃子 shell 中打印 `bgpids.nalloc/storage/npid` 与 `js.c_childmax`，确认未初始化状态；② 若确认是 SIGCHLD 早于初始化，则查 `sigchld_handler` 的投递与 `initialize_job_control` 顺序。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
