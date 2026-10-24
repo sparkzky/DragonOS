@@ -491,6 +491,28 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 
 ### 3.38 OCManager 服务栈在 DragonOS 上跑通（2026-10-24）
 
+> 更新（2026-10-24 晚）：脚本已补上 oc-msg-etl 服务，且 footstone 的 `MSG_ETL`
+> 修正为 `ip://127.0.0.1:7778`（与 compose 一致）。最终 6 个容器全部 Up，
+> 21000 与 8080 均返回 `HTTP/1.0 200 OK`。
+
+### 3.39 utime(2) 实现与验证（2026-10-24）
+
+- 服务栈运行期持续出现 `Unsupported syscall ID: 132 -> SYS_UTIME`（约每 4 秒一次），说明有用户态程序依赖该调用。
+- 实现：`utime(filename, utimbuf{actime, modtime})` 转成两个 `tv_nsec=0` 的 `timespec`，
+  复用 `utimensat` 的解析/权限路径（AT_FDCWD、空 flags、跟随符号链接、`times==NULL` 表示当前时间）。
+- 验证：同栈重跑后该报错计数为 **0**，六服务正常。
+
+### 3.40 脏 journal 重放期 panic（复现，待定位）
+
+- 现象：上一次运行留下脏 journal（`dirty journal detected ... replaying now`）后启动，
+  连续两次在重放期间 panic：
+  - `fault.rs:358 Kernel code at <Softirq::do_softirq+0> illegally accessed user address`
+  - `trap.rs:369 do_undefined_opcode(6)`，rip 位于 `CpuRunQueue::check_preempt_current`
+  - 二次 panic 触发 `[nested-panic] ... parking`
+- 判定：与 utime/USB 无关——重建净盘后同一内核（#239）启动正常；属脏 journal 重放路径的
+  健壮性缺陷，需单独复现定位（与本轮已修复的三个自死锁无关联）。
+### 3.38 OCManager 服务栈在 DragonOS 上跑通（2026-10-24）
+
 一键脚本见 `docs/ocmanager-porting/guest-stack-up.sh`（注入 guest 根目录后 `sh /up_ocm.sh`）：
 
 | 服务 | 端口 | 状态 |
