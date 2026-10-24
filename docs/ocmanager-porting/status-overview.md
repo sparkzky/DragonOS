@@ -392,6 +392,11 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 - 结论（推断）：这是 bash 在**子 shell 的 job-control 状态未就绪**时进入 pid 状态表读取的时序问题；DragonOS 侧只影响该路径的触发概率（如 SIGCHLD 投递时机），非内核数据损坏。
 - 下一步：① 用 `gdb`/kprobe 在崩溃子 shell 中打印 `bgpids.nalloc/storage/npid` 与 `js.c_childmax`，确认未初始化状态；② 若确认是 SIGCHLD 早于初始化，则查 `sigchld_handler` 的投递与 `initialize_job_control` 顺序。
 
+### 3.24 bgpids 现场探针（2026-10-24）
+- 已加入探针：当用户态 #PF 命中崩溃特征时，额外读取 PIE 基址(0x10000)+`bgpids`(0x122f50) 的 32 字节并打印 `storage/nalloc/head/npid`（提交见 git log）。
+- 本轮复现尝试中，`docker run … /t41.sh` 启动阶段触发了一次 `TASK DUMP` 并停在挂起状态，未产生新的 #PF，探针数据待下一轮取得。
+- 复现时注意：先 `dragon-docker-start` 等 daemon 就绪（约 20s）再起容器，避免把 daemon 启动慢误判为挂起。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
