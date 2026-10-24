@@ -920,6 +920,17 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 3. 若确认深栈：拆分/降栈（避免大对象、减少内联与递归），而不是简单加大栈；
 4. 同时检查 journal 提交内是否存在 `alloc → reclaim/writeback → 再次提交` 的重入链。
 
+**新增取证能力**（`2ce7dc19`）：`do_double_fault` 现在同时打印 `CR2`，#DF 无需 gdb 即可
+看到级联缺页地址；已用“直接调用处理器”的方式验证输出格式：
+
+```
+[#DF] double fault (IST): err=0x0 cr2=0x27008 rsp=0x0 rip=0x0 -- halted
+```
+
+**复现资产**：`/home/sparkzky/ocm-tars/dirty-repro-2026-10-25.img`（16G，来自 guard 内核 #DF
+停机后强杀的盘；启动即命中根挂载期 journal 重放故障）。注意每次启动都会重放并改变该盘，
+诊断前先复制一份。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
