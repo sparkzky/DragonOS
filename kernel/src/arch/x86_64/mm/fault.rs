@@ -560,8 +560,18 @@ impl X86_64MMArch {
                         // 用户态 #PF 的 TrapFrame 没有原 syscall 号（errcode 是
                         // 硬件错误码），因此把 rax/rdi/rsi/rdx 一并打印——它们
                         // 通常仍是该 syscall 的号与入参，足以判断崩在哪次调用。
+                        // 临时诊断：验证 rip 是否可信——读取 rip 处 8 字节指令，
+                        // 并输出 cs/ss/rflags，便于判断 trap frame 是否错乱。
+                        let insn = crate::syscall::user_access::UserBufferReader::new(
+                            regs.rip as *const u8,
+                            8,
+                            true,
+                        )
+                        .and_then(|reader| reader.read_one_from_user::<[u8; 8]>(0))
+                        .map(|bytes| bytes)
+                        .ok();
                         log::error!(
-                            "pid: {} ({}) No mapped vma, error_code: {:?}, rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
+                            "pid: {} ({}) No mapped vma, error_code: {:?}, rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, cs:{:#x}, ss:{:#x}, rflags:{:#x}, insn:{:02x?}, flags: {:?}",
                             ProcessManager::current_pid().data(),
                             ProcessManager::current_pcb().basic().name(),
                             error_code,
@@ -572,6 +582,10 @@ impl X86_64MMArch {
                             regs.rsi,
                             regs.rdx,
                             regs.rsp,
+                            regs.cs,
+                            regs.ss,
+                            regs.rflags,
+                            insn,
                             flags
                         );
 
