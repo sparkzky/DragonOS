@@ -611,6 +611,38 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 7. QEMU 内存 >2G 且非 6G 时挂死（D）。
 8. R15 压测与 mysql 终验（#2495 已关闭，验证通过前不重提）。
 
+## 3.43 非 6G 内存挂死与脏 journal panic 同源（2026-10-24 取证）
+
+`DRAGONOS_QEMU_MEMORY=4G` 时在根挂载阶段**确定性**复现；12G 在脏 journal 下同样可复现，
+两者是同一处内存破坏的不同下游表现。
+
+### 3.43.1 首个 panic（gdb 断在 panic_fmt 取证）
+
+- 消息：`current_pcb weak upgrade failed (pcb freed?)`。
+- 调用链（栈符号化）：`log!` → `KernelLogger::log` →
+  `virtio_console::critical_output_available` →
+  `SpinLock<Option<Arc<SrcuNotifierChain<RebootNotifyEvent, String>>>>::lock_irqsave`
+  → `ProcessManager::current_pcb`。
+- `arch_current_pcb()` 从 `rsp & ~0x7FFF` 取栈底槽（应为 PCB 的 Weak）：实测槽值
+  `0xffff800140208500`（指向同一栈内），既非合法 ArcInner 指针，也不是 null。
+- 结论：日志路径在某个上下文里以“错误/已失效的栈底槽”调用 `current_pcb`，进而 panic；
+  随后的 panic 打印路径又触发 softirq 对象被栈帧覆盖（§3.40 的 dump）。
+
+### 3.43.2 另一形态
+
+同配置另一次启动的首个故障是 `do_general_protection(13)`，`Segment Selector Index: 0x0`，
+`pid=RawPid(20)`、`rip=0xffff800000d4a53d`——加载了空选择子，属同类内存破坏的下游。
+
+### 3.43.3 新增取证设施
+
+- `find_task_by_stack_base()`：按 kernel/syscall 栈起始地址反查任务；
+- `CURRENT_PCB_DIAG`（`no_mangle`，vmcore 可读）：失败瞬间记录 base/slot/owner_pid/kind/rsp；
+- 失败 panic 消息内联 owner 信息。
+提交：`7359d0df`。
+
+下一步：用 `CURRENT_PCB_DIAG` 的 owner 字段确认该栈属于哪个任务，再追该任务的 PCB 生命周期
+（为何 Strong 归零或槽被覆盖）。
+
 ## 4. 独立待办与当前阻断（2026-10-23）
 
 | 问题 | 状态/证据 |
