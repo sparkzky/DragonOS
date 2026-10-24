@@ -882,6 +882,44 @@ CURRENT_PCB_DIAG = [base=0xffff800340208000, slot=0xffff800340208500,
 2. 若可用，在脏 journal 复现上开 guard，抓栈溢出缺页的 rip；
 3. 否则在 `schedule`/`switch_to` 记录每次切换时 prev 栈的最低水位，定位最深调用链。
 
+## 3.48 guard 内核根挂载期真实 #DF：IST 首次在生产路径生效（2026-10-25）
+
+前置：§3.46 修复 flush 锁互等后，用 `KERNEL_FEATURES=kstack_protect`（#263，12G，净盘 + seed）
+重跑启动。
+
+**现象**：`Try to mount root fs...` 之后立即：
+
+```
+[#DF] double fault (IST): err=0x0 rsp=0xffff800340327c00 rip=0xffff800000d9bb01 -- halted
+```
+
+- 符号化：`rip → another_ext4::ext4::journal_transaction::encode_log_images`；
+- gdb：`CR2 = 0xffff800340327bf8 = rsp - 8`；#DF 处理器运行在 IST 栈
+  `DOUBLE_FAULT_STACKS+16176 (0xffff800001a700b0)`，证明 IST 在生产故障路径上生效。
+
+**与非 guard 构建的关联**：同一路径在非 guard 内核上的症状就是 §3.47 的
+`current_pcb` 失败（栈底槽被覆盖）；本次 DF 的 rsp 距栈顶仅 `0x800` 左右，与
+§3.47.1 “30.5K/32K 已用”一致。两者指向同一结论：**根挂载期的 ext4 journal 提交路径
+栈用量逼近 32 KiB 上限**。guard 把越界写变成异常；异常投递在同样耗尽的栈上再次压栈，
+于是升级为 #DF，由 IST 捕获。
+
+**未解释点（需要内核内取证，不能靠事后 gdb）**：
+
+gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全零且可读，说明该页
+当前 present，与“guard 页未映射”矛盾。两种可能：
+1. `CR2` 是更早一次缺页遗留（x86 不会在 #DF 时更新 CR2）；
+2. guard 重映射与直接映射别名在该地址上不一致（`KernelMapper.remap` 未覆盖到 CPU 实际
+   使用的那个别名）。
+
+**下一步**：
+
+1. 在 `commit_journal` / `encode_log_images` 入口记录 `rsp`，并在出口比较 per-CPU 栈水位，
+   得到该路径的真实峰值深度（不依赖 guard）；
+2. 复核 guard 页在**任务实际使用的地址别名**上是否真的 not-present（读 PTE 的 present 位，
+   而不是用 gdb 读内容）；
+3. 若确认深栈：拆分/降栈（避免大对象、减少内联与递归），而不是简单加大栈；
+4. 同时检查 journal 提交内是否存在 `alloc → reclaim/writeback → 再次提交` 的重入链。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -907,12 +945,12 @@ CURRENT_PCB_DIAG = [base=0xffff800340208000, slot=0xffff800340208500,
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 已成功读到 `CURRENT_PCB_DIAG`（§3.47）：失败时 `rsp` 不在任何已登记任务栈上，槽值恒为 `base+0x500`（4G/12G 同一签名）→ 真正问题是 **rsp 本身无效**，不是槽被写坏。下一步：在 `switch_to`/trap 入口校验 rsp 是否落在登记栈内（guard 页可直接判定），定位 rsp 被破坏的第一现场 |
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 根因范围已收窄到**根挂载期 ext4 journal 提交路径的栈耗尽**：DIAG 显示 30.5K/32K（§3.47）；guard 内核下同一路径直接 #DF 于 `another_ext4::encode_log_images`，rsp 距栈顶 ~0x800（§3.48）。下一步：在内核内记录该路径栈水位峰值 + 复核 guard PTE 的 present 位 |
 | 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
-| 6 | `kstack_protect` 默认启用 | §3.46：flush 锁互等已修（`99663970`）；guard 下 docker/容器/commit 通过，但全栈 `/up_ocm.sh` 未跑通（停滞原因待查），保持默认关闭 |
+| 6 | `kstack_protect` 默认启用 | §3.46：flush 锁互等已修；§3.48：guard 在根挂载期把静默栈溢出变成 #DF（IST 捕获），但全栈仍未跑通，保持默认关闭；待 #1 的栈用量问题解决后重评 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
