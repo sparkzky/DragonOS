@@ -153,8 +153,9 @@ fn first_allowed_online_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
 
 fn rq_nr_running(cpu: ProcessorId) -> usize {
     let rq = cpu_rq(cpu.data() as usize);
-    let (rq, _guard) = rq.self_lock();
-    rq.nr_running
+    // 并发（含同栈重入）时把该 CPU 视为最忙，让负载选择跳过它；见
+    // `CpuRunQueue::try_nr_running` 的说明。
+    rq.try_nr_running().unwrap_or(usize::MAX)
 }
 
 fn select_fork_idle_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Option<ProcessorId> {
@@ -597,6 +598,16 @@ impl CpuRunQueue {
             core::hint::spin_loop();
         };
         (self.force_mut_locked(), guard)
+    }
+
+    /// 非阻塞读取 `nr_running`：锁被占用（含同栈重入）时返回 None。
+    ///
+    /// 供 `select_task_rq` 的负载探测使用：该路径可能在已持有同一 rq 锁的
+    /// 调用栈里被重入（持 rq 锁的 `check_preempt_current` → wakeup →
+    /// select_task_rq），阻塞获取会自旋到 self_lock 的 1e6 次阈值后 panic。
+    pub fn try_nr_running(&self) -> Option<usize> {
+        let _guard = self.lock.try_lock_irqsave().ok()?;
+        Some(self.force_mut_locked().nr_running)
     }
 
     /// Best-effort current-task snapshot for lockup diagnostics.
