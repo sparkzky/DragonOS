@@ -1100,6 +1100,81 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
 永不复用的静态 `FlushTlbInfo` 槽），IPI handler 全程无锁；同时在
 `SpinLockGuard::drop` 增加释放后自检以证伪/证实泄漏。
 
+### 更新（同日，`85cf41cf` 无锁 CSD + rq 自锁服务入站：死锁解除，16 容器可达）
+
+按上节结论直接重写协议，不再在旧 CSD 上打补丁：
+
+1. **`CsdFlushTlb` 无锁化**（`kernel/src/mm/tlb.rs`）：`SpinLock<Option<ptr>>`
+   → `AtomicPtr<FlushTlbInfo>` + `AtomicBool done`。
+   - 发布方先 `done=false`（Release）再写 `info`（Release），然后发 IPI。
+     顺序不可颠倒：若先写 info，迟到的 IPI 可能取走指针并置 `done=true`，
+     随后发布方清 `done` 会让本次请求永久丢失 ack。
+   - 接收方 `info.swap(null)` **只有一方**取到指针并负责 `local_flush_tlb_func`
+     + `done=true`；嵌套 IPI/服务路径拿不到指针就直接返回，不会解引用
+     已失效的发起方栈帧（此前 `take()` + 锁提供的保护由此保留）。
+   - 等待窗口不再持有任何锁，`info` 锁作为死锁媒介的可能性被彻底移除。
+2. **`CpuRunQueue::self_lock` 等待时服务入站 shootdown**（`kernel/src/sched/mod.rs`）：
+   该锁是唯一没有接入 `spinlock_hook` 的关中断自旋点，导致
+   「A 持 rq 锁等 ack / B 在 rq 自锁里关中断无法应答 → B spinout panic」。
+   实测 panic 栈即 `eventfd write → epoll wakeup → enqueue_task_on_cpu →
+   __set_task_cpu → prepare_task_rq_migration → self_lock`。现每 1024 次
+   自旋调用 `mm::tlb::service_inbound_flush_from_spin()`。
+
+### 2026-10-25 深夜端到端验收（内核 #290，12G，净重启后单次运行）
+
+前置：`sh /root/fs2.sh`（16 容器，含就绪探活）→ 约 10 分钟到 `UPALL_END`，
+串口停更后系统仍可交互，**无 spinout / 无 panic / 无 TLB 挂死**。
+
+| 验收项 | 请求 | 结果 |
+|---|---|---|
+| 并发 exec 压测 | 8 个容器 × 15 轮 `docker exec … true`（共 120 次） | `STRESS_OK`，系统无异常 |
+| 前端 | `GET http://frontend/`（经 nginx） | 返回 HTML |
+| footstone 健康 | `GET http://footstone:20001/health` | `{"status":"ok"}` |
+| msg-etl 健康 | `GET http://msg-etl:8081/health` | `{"status":"ok"}`（该轮 msg-etl 在运行） |
+| sysdiagnose 健康 | `GET http://sysdiagnose:8081/health` | `{"status":"ok"}` |
+| 登录 | `User/IdentifyAccount`，`loginname=admin`，`password=SHA512("Admin123456@")` 的 hex | `success:true`，`jwt_token`（296 字符） |
+| 鉴权 | `User/GetCurrentUser` + `Authorization: <jwt>` | `success:true`，`is_super_admin:true` |
+| 项目列表 | `Footstone/ListProjects`，体为 `{"page_request":{"page_size":10,"page_number":1}}` | `200`，返回「默认」项目（522 字节） |
+| 指标（ClickHouse） | `Metrics/ListMetricsData {"plugin_name":"os_monitor"}` | `success:true`，空列表 |
+| sysdiagnose 业务 | `Project/ListGlobalCmds` | 返回内置命令列表 |
+| api → task-manager | `POST http://api:8080/api/v1/ops_tasks/list` | `code:OK`，`data.tasks=[]`（133 字节） |
+| api → asset-manager | `POST http://api:8080/api/v1/assets/add`（见下方签名要求） | `code:OK`，`asset.id=1` |
+| 持久化 | 同 uuid 再 add | `FAILED_PRECONDITION: UNIQUE constraint failed: assets.uuid`（证明上一条已落库） |
+
+验收口径补充（部署侧，非内核）：
+
+1. `api` 的**变更类端点**要求网关签名：容器内有
+   `TMS_API_GW_HMAC_SECRET=devsecret…`，即使 `TMS_API_GW_HMAC_STRICT=false`
+   也会校验。签名串为
+   `METHOD\nPATH\nX-User-Name\nX-User-Role\nTIMESTAMP\nNONCE\nSHA256(body)`，
+   HMAC-SHA256 + hex，另需 `X-User-Name`/`X-User-Role`/`X-Signature-Timestamp`/
+   `X-Signature-Nonce`。guest 与宿主时钟相差 8 小时，时间戳必须以 guest 为准。
+2. `wget` 对非 2xx 会丢弃响应体并以退出码 6 结束；取证需要
+   `--content-on-error`，否则会误判为「空响应」。
+3. 每次 `docker exec` 都会打印 `WARNING: --criu ignored (criu binary from $PATH is used); do not use`，
+   属噪声，不影响命令结果。
+
+### 仍未闭环（按优先级）
+
+1. **kafka（JVM）偶发启动失败**：bitnami entrypoint 报
+   `libfile.sh: line 41: echo: write error: Operation not supported` 后 `Exited(1)`；
+   `docker start` 复起时 java 出现大量 `No mapped vma` 用户态缺页（pid 7525，
+   rip 在 JIT 区）。kafka 不在时 msg-etl 因 broker 解析失败退出
+   （`lookup kafka on 127.0.0.11:53: server misbehaving`）。
+   同一次运行的 #286 上两者均 Up，属状态相关。
+2. **SQLite 第二次写入报 `disk I/O error: operation not supported`**：
+   - 同进程第一次 `assets/add` 成功落库；第二次新插入必现失败，
+     重复 uuid 则是 `UNIQUE constraint failed`（说明读路径正常）；
+   - `asset-manager` 的 CRL 周期重建也曾在运行数分钟后以此错误失败；
+   - 内核侧新增的 EOPNOTSUPP 系统调用追踪计数为 **0**，且用静态探针在
+     容器内 `/data` 与 guest `/root` 上验证
+     `open/pwrite/ftruncate/mmap(offset≠0)/msync/fdatasync/fallocate/
+     fcntl(F_SETLK,F_GETLK)/fsync(dir)` 全部成功 ——
+     该 errno 并非来自这些系统调用的返回值，需要继续在 sqlite VFS
+     （`xShmMap`/`xShmLock`/`xFileControl`）语义上定位。
+3. `docker ps` 中容器退出后其 DNS 记录立即消失，导致依赖方
+   `getent hosts` 失败——这是 docker 行为，排查时需要先确认容器是否还在运行。
+
 ### 下一步
 
 1. 用 gdb 判定 CPU0 自旋锁的归属（读 CSD/PerCpuVar 基址比对，或给 SpinLock
