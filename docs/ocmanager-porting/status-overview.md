@@ -1012,6 +1012,58 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
    gVisor/dunitest 对应用例失败，即从该调用开始补；
 4. `/proc/net/tcp` 为空（§3.42.3 #4）同样按“有消费者时再补”的方式记录。
 
+## 3.50 全量容器移植进展（2026-10-25 晚）
+
+目标：16 个容器（5 infra + 4 app + 7 TMS）全部运行 + 端到端验收。
+计划见 `full-stack-plan-2026-10-25.md`。
+
+### 已完成
+
+1. **镜像**：宿主构建 `oc-tms-{gateway,api,asset-manager,heartbeat,task-manager,
+   file-svc,data-proxy}:dev` 与 `oc-frontend:dev`（asset-manager 走 CGO+musl），
+   `docker save | gzip` 经 slirp HTTP 传入 guest 并 `docker load` 成功（8/8）。
+2. **网络**：guest 内 `docker network create` + 容器名/别名 DNS 实测可用
+   （`getent hosts alpha` → 172.18.0.2），因此按 compose 的内部端口与
+   服务名（mysql/redis/kafka/clickhouse/footstone/msg-etl/sysdiagnose/
+   gateway/api/asset-manager/heartbeat/task-manager/file-svc/data-proxy）
+   直接部署，TMS 的 `ocm-redis`/`ocm-kafka` 用 `--network-alias` 提供。
+3. **启动**：`/root/fs2.sh`（= `docs/ocmanager-porting/full-stack-up.sh` 的扩展版）
+   带就绪探活，**16 个容器全部创建并进入 Up**；CA 由 asset-manager 自动生成
+   （CA_READY=0）；MySQL/ClickHouse 建库与 4+2+1 个迁移全部成功；
+   nginx 前端返回 HTML；`membarrier`/`io_setup` 等探测调用均有降级。
+4. **本轮内核修复**：
+   - ext4 `stat_file_attr` 的 delalloc 全表扫描 → 按 inode 索引（`9c7040b1`），
+     容器启动/镜像加载从数十分钟降到分钟级；
+   - 调度 `rq_nr_running` 在 `wakeup→select_task_rq` 中重入 rq 锁导致
+     `self_lock spinout` panic → 改为 `try_nr_running()` 非阻塞（同提交）。
+
+### 当前阻塞（未通过）
+
+并发 `docker exec`（脚本的就绪轮询）期间出现**系统级挂死**，gdb 现场：
+
+| CPU | 位置 |
+|---|---|
+| CPU0 | `remote_flush_tlb_on_ipi` → 通用 `SpinLock::try_lock` 自旋（锁地址在堆上，符号被 ICF 折叠，无法唯一判定） |
+| CPU1 | `flush_tlb_multi` 的 ack 轮询 `movzbl 0x18(%r13)`（等 CPU0 的 ack） |
+
+CPU1 的栈回溯指向 `flush_tlb_kernel_range_inner` ← `KernelStack::new_with_account`，
+即 kstack_protect 的 guard 映射 flush（在 `KSTACK_LOCK` 内、关中断）发起同步
+shootdown，等待 CPU0 ack；CPU0 却卡在 IPI handler 的锁上。这是 §3.46 同类的
+“发起者等 ack、目标无法完成 handler”死锁的又一形态，尚未定位最终锁归属。
+
+另外仍可见 `pcache stall: wait_ready Loading exceeded 8s`——页缓存 Loading 页
+完成延迟，可能与上述 IPI/锁问题或块层延迟相关。
+
+### 下一步
+
+1. 用 gdb 判定 CPU0 自旋锁的归属（读 CSD/PerCpuVar 基址比对，或给 SpinLock
+   加 owner CPU 诊断）；
+2. 若确认是 CSD `info` 锁，重设计协议：IPI handler 无锁读取/一次性发布，
+   或 initiator 在等待 ack 时不持有任何 handler 需要的锁；
+3. 根挂载/kstack flush 路径评估：guard flush 是否需要远程 shootdown（新栈
+   首次映射时其他 CPU 不可能持有该地址的 TLB 项），可改为仅本地失效；
+4. 解决后再跑 16 容器 + 端到端验收（前端登录、TMS 链路、业务 API）。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -1031,6 +1083,8 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 | `docker commit` 导出层失败 | ext4 符号链接 xattr 读取改为 ENODATA（`8ca49350`，§3.44.2），净盘提交+运行验证通过 |
 | IRQ 独立栈（#DF） | 每 CPU IST 栈 + 门 8 `ist=1` + 零分配停机（`8f6156c9`，§3.45），故障注入验证无三重错误 |
 | TLB shootdown IRQ-off 互等 | 等待锁时服务入站请求 + CSD 指针置空（`99663970`，§3.46.3），guard 内核下 docker 拉起/容器/commit 通过 |
+| ext4 stat O(claims) | delalloc 按 inode 建索引（`9c7040b1`，§3.50），16 容器启动 ~4 分钟 |
+| 调度 rq 重入自旋 panic | 负载探测改 `try_nr_running`（`9c7040b1`），futex 定时器路径不再 spinout |
 | journal 路径栈耗尽 | 4 KiB 块改为堆分配（`662fc12c`，§3.48.1），脏 journal 重放不再 #DF |
 | guard page 默认启用 | `kstack_protect` 加入默认 features（`8c9aa9e0`）；默认构建 #276 全栈验收通过 |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
@@ -1045,6 +1099,9 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
 | 6 | `kstack_protect` 默认启用 | 已完成：flush 互等修复 + journal 栈临时修复后，guard 下全栈通过，已加入默认 features（`8c9aa9e0`），默认构建 #276 验收通过 |
+| 7 | **全量 16 容器移植**（进行中） | 镜像/网络/启动已打通（§3.50），16 容器均能 Up；并发 docker exec 期间出现 TLB/IPI 挂死（CPU0 IPI handler 自旋、CPU1 等 ack），未通过端到端验收 |
+| 8 | `pcache stall: wait_ready Loading` | 页缓存 Loading 页完成延迟（8s 级），与 #7 同期出现，待定位 |
+| 9 | ext4 stat delalloc 扫描 / sched rq 自旋 | 已修（`9c7040b1`），容器启动从数十分钟降到分钟级 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
