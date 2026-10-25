@@ -1192,19 +1192,30 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
 
 ### 仍未闭环（按优先级）
 
-1. **asset-manager 写入仍报 `disk I/O error: operation not supported`**
-   （`eb8f7582` 之后才可精确定位为**非** overlay mmap 问题）：
-   - 同一容器、同一 bind mount 路径（`/data/ocm/asset-manager`）下，
-     独立 sqlite 程序（同驱动 mattn/go-sqlite3、同 DSN、WAL 与 DELETE）
-     写入完全正常；双连接交替写也正常；
-   - 删库重启后**第一次** `assets/add` 也失败，排除"历史 WAL/-shm 状态"；
-   - 与 **`pcache stall: wait_ready Loading exceeded Ns`** 强相关
-     （本轮 8 次，最长 8s，同一 pid 持续等待）——怀疑某个页长时间滞留在
-     `Loading` 状态，导致写/提交路径拿到错误并映射为 EOPNOTSUPP；
-   - 内核侧 EOPNOTSUPP 系统调用追踪计数为 0，说明该 errno 不是 syscall
-     返回值，而是内核内部错误路径经 VFS 冒泡。
-   下一步：在 `PageCache` 的 `Loading` 状态机与写回错误路径上加诊断
-   （记录 pid/ino/pgoff/状态迁移），并抓 `pcache stall` 的 pid 归属。
+1. **写入失败已定位到 ext4 unwritten extent（`ada1c760` 诊断确认）**
+   - 直接证据：容器内 sqlite 报
+     `code=SQLITE_IOERR(10) extended=SQLITE_IOERR_WRITE(778) sysErrno=95`；
+     内核侧抓到 `SYS_WRITE` 返回 EOPNOTSUPP，创建点为
+     `another_ext4/src/ext4/extent.rs:636`
+     （`extent_right_spine_projection_from_view`：**文件最后一个 extent 是
+     unwritten 时直接返回 ENOTSUP**）。
+   - 这解释了全部现象：`posix_fallocate`（sqlite、JVM 都会用）产生
+     unwritten extent，之后的 `pwrite`/`write` 就永久失败；
+     `cp` 出来的副本（内容重写成新文件、extent 是 written）正常；
+     重复 uuid 的报错是 UNIQUE 约束（读路径正常）。
+   - 尝试过把 `try_prepare_transactional_range` 的预分配从 unwritten 改为
+     written（该路径先用 `initialize_allocated_range` 把区间写零并 flush，
+     语义等价），但**新建库后仍然失败**，说明还有别的 unwritten 产生点
+     （`extent.rs` 的 `mark_unwritten` 站点：881/952/1007/1843），
+     未验证的改动已回退，不留在树上。
+   - 下一步（明确）：定位剩余的 unwritten 产生点（含 `fallocate_with_context`
+     调用的 crate API），或实现写入时的"未写→已写"转换
+     （对标 Linux `ext4_convert_unwritten_extents`），再做双写验证。
+   - 诊断已提交（每次启动至多打印一次）：`Ext4Error::new` 的
+     `#[track_caller]` 创建点、写回错误与 pcache Loading 归属、
+     syscall 表分派处的 EOPNOTSUPP 名字+栈。
+     注意：`SystemError::to_posix_errno()` 返回**负数**，比较必须用 `-95`；
+     此前诊断一直打印 0 就是踩了这个坑。
 2. **kafka(JVM)/msg-etl**：OverlayFS 缺页修复后本轮 16 容器全部 Up，
    但历史上曾偶发失败，需要长跑观察确认不再复现。
 3. `docker ps` 中容器退出后其 DNS 记录立即消失，导致依赖方
