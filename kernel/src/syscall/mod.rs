@@ -154,6 +154,23 @@ impl Syscall {
                     );
                 }
 
+                // 诊断：表驱动 syscall 返回 EOPNOTSUPP 时记录 syscall 名与现场栈。
+                // （容器内 sqlite 提交失败只拿到 errno 95，需要定位产生点。）
+                if let Err(error) = &r {
+                    if error.to_posix_errno() == -95 {
+                        static REPORTED: core::sync::atomic::AtomicBool =
+                            core::sync::atomic::AtomicBool::new(false);
+                        if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                            log::error!(
+                                "syscall {} (nr={}) returned EOPNOTSUPP, pid={}, stack trace follows",
+                                handler.name,
+                                dispatch_nr,
+                                ProcessManager::current_pid().data()
+                            );
+                            crate::debug::panic::hook::print_stack_trace();
+                        }
+                    }
+                }
                 // Write the final return value into the return-value register
                 let rax_value: usize = match r {
                     Ok(v) => v,
@@ -211,7 +228,7 @@ impl Syscall {
                 };
                 // 诊断：定位返回 EOPNOTSUPP 的系统调用（容器内 sqlite/WAL 提交失败取证）。
                 if let Err(e) = &r {
-                    if e.to_posix_errno() == 95 {
+                    if e.to_posix_errno() == -95 {
                         static EOPNOTSUPP_LOGS: core::sync::atomic::AtomicUsize =
                             core::sync::atomic::AtomicUsize::new(0);
                         if EOPNOTSUPP_LOGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 200

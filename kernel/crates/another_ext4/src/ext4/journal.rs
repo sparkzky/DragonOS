@@ -152,6 +152,9 @@ impl Ext4 {
 
     pub(super) fn mark_direct_mount_dirty(&mut self) -> Result<()> {
         if self.write_barrier && !self.block_device.supports_reliable_flush() {
+            log::error!(
+                "another_ext4: journal path rejected: write_barrier set but block device reports no reliable flush"
+            );
             return Err(Ext4Error::new(ErrCode::ENOTSUP));
         }
         let mut sb = self.read_super_block_cached();

@@ -76,14 +76,31 @@ impl Debug for Ext4Error {
 }
 
 impl Ext4Error {
-    pub const fn new(code: ErrCode) -> Self {
+    #[track_caller]
+    pub fn new(code: ErrCode) -> Self {
+        if code == ErrCode::ENOTSUP {
+            // 诊断：ENOTSUP 在转换为内核 SystemError 时只剩 errno 95，
+            // 这里记录一次，用于定位"operation not supported"的来源。
+            static REPORTED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                log::error!("another_ext4: ENOTSUP created at {}", core::panic::Location::caller());
+            }
+        }
         Ext4Error {
             code,
             message: None,
         }
     }
 
-    pub const fn with_message(code: ErrCode, message: String) -> Self {
+    /// 构造带原因说明的错误。
+    ///
+    /// 命中 `ENOTSUP` 时先打印原因：该错误码在转换成内核 `SystemError`
+    /// 时会丢弃 message，只剩下 errno 95，无法定位具体是哪个"不支持"路径。
+    pub fn with_message(code: ErrCode, message: String) -> Self {
+        if code == ErrCode::ENOTSUP {
+            log::warn!("another_ext4: ENOTSUP: {}", message);
+        }
         Ext4Error {
             code,
             message: Some(message),

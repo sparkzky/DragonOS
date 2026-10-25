@@ -675,6 +675,9 @@ impl Transaction<'_> {
             return Ok(());
         }
         if !device.supports_reliable_flush() {
+            log::error!(
+                "another_ext4: journal commit rejected: block device reports no reliable flush"
+            );
             return self.fail(
                 Ext4Error::new(ErrCode::ENOTSUP),
                 CommitFailure::BeforeCommit,
@@ -885,6 +888,9 @@ impl JournalTransactionCore {
     ) -> core::result::Result<(), CommitError> {
         let core = self;
         if !device.supports_reliable_flush() {
+            log::error!(
+                "another_ext4: journal commit_images rejected: block device reports no reliable flush"
+            );
             return core.commit_error(
                 Ext4Error::new(ErrCode::ENOTSUP),
                 CommitFailure::BeforeCommit,

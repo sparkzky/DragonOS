@@ -1,6 +1,6 @@
 use core::{
     mem::{self, ManuallyDrop},
-    sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -515,6 +515,17 @@ impl PageCacheWritebackDomain {
     }
 
     pub fn record_writeback_error(&self, error: SystemError) {
+        // 诊断：EOPNOTSUPP 一旦被记录，会通过 ErrSeq 持续污染该文件的所有后续
+        // 写请求（上层看到的就是 "disk I/O error: operation not supported"）。
+        // 这里打印一次现场栈，直接定位它是谁产生的。
+        if error == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            static REPORTED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                log::error!("pcache: recording EOPNOTSUPP writeback error, stack trace follows");
+                crate::debug::panic::hook::print_stack_trace();
+            }
+        }
         let superblock = self
             .state
             .lock_irqsave()
@@ -1103,6 +1114,8 @@ struct PageEntryState {
     /// only because PageEntry is Arc-shared like the incarnation itself.
     dirty_transition_kind: AtomicU8,
     writeback_tag: AtomicU64,
+    /// 诊断：最近一次把该 entry 置为 `Loading` 的进程 pid（0 表示未记录）。
+    loading_owner_pid: AtomicU32,
     /// Identity of the current (or most recently completed) Writeback
     /// incarnation. It is published under `InnerPageCache::inner`.
     writeback_incarnation: AtomicU64,
@@ -1936,6 +1949,11 @@ impl PageEntry {
                 dirty_incarnation: AtomicU64::new(0),
                 dirty_transition_kind: AtomicU8::new(0),
                 writeback_tag: AtomicU64::new(0),
+                loading_owner_pid: AtomicU32::new(if state == PageState::Loading {
+                    crate::process::ProcessManager::current_pid().data() as u32
+                } else {
+                    0
+                }),
                 writeback_incarnation: AtomicU64::new(0),
                 accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
                 accounted_unevictable: AtomicBool::new(false),
@@ -2040,6 +2058,11 @@ impl PageEntry {
     }
 
     fn set_state(&self, state: PageState) {
+        if state == PageState::Loading {
+            // 诊断：记录发起加载的进程，便于定位"Loading 永远不完成"的归属。
+            self.loading_owner_pid
+                .store(crate::process::ProcessManager::current_pid().data() as u32, Ordering::Relaxed);
+        }
         self.state.store(state as u8, Ordering::Release);
     }
 
@@ -2190,9 +2213,14 @@ impl PageEntry {
                     let n = STALLS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
                         crate::print_critical!(
-                            "pcache stall: wait_ready Loading exceeded {}s (pid={})\n",
+                            "pcache stall: wait_ready Loading exceeded {}s (waiter_pid={}, owner_pid={}, entry=0x{:x}, instance_id={}, page_phys=0x{:x}, state={:?})\n",
                             n + 1,
-                            crate::process::ProcessManager::current_pid().data()
+                            crate::process::ProcessManager::current_pid().data(),
+                            self.loading_owner_pid.load(Ordering::Relaxed),
+                            &**self as *const PageEntryState as usize,
+                            self.instance_id,
+                            self.page.phys_address().data(),
+                            self.state(),
                         );
                     }
                 }
@@ -2646,6 +2674,17 @@ impl PageCache {
     /// semantics without assuming that a weak filesystem owner survived an
     /// asynchronous writeback completion.
     pub fn record_writeback_error_with_superblock(&self, error: SystemError) {
+        // 诊断：EOPNOTSUPP 一旦进入 ErrSeq，就会持续污染该文件/该挂载点后续的
+        // 写请求（上层表现为 "disk I/O error: operation not supported"）。
+        // 打印一次现场栈，直接定位产生点。
+        if error == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            static REPORTED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                log::error!("pcache: recording EOPNOTSUPP writeback error, stack trace follows");
+                crate::debug::panic::hook::print_stack_trace();
+            }
+        }
         self.record_writeback_error(error.clone());
         if let Some(domain) = self.writeback_domain.as_ref().and_then(Weak::upgrade) {
             domain.record_writeback_error(error);
