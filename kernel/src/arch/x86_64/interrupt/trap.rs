@@ -410,6 +410,7 @@ unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) 
     emergency_print_hex_noalloc(regs.rsp);
     emergency_print_noalloc(" rip=");
     emergency_print_hex_noalloc(regs.rip);
+    crate::arch::x86_64::driver::apic::apic_timer::print_stack_low_rsp_all();
     emergency_print_noalloc(" -- halted\n");
     loop {
         core::arch::asm!("cli; hlt", options(nomem, nostack));

@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::driver::{
     hpet::{hpet_instance, is_hpet_enabled},
@@ -442,8 +442,67 @@ impl LocalApicTimer {
 
     pub(super) fn handle_irq(trap_frame: &TrapFrame) -> Result<IrqReturn, SystemError> {
         // sched_update_jiffies();
+        note_interrupted_kernel_rsp(trap_frame.rsp as usize);
         crate::time::deadline::handle_irq(trap_frame);
         return Ok(IrqReturn::Handled);
+    }
+}
+
+/// 每 CPU 观察到的“内核态被中断时的 rsp”最低值（按 32K 栈窗口分组）。
+///
+/// 定时器（250Hz）在任意内核调用深度触发，`TrapFrame.rsp` 就是被中断上下文的
+/// 栈指针。内核栈按 `KernelStack::ALIGN`（0x8000）对齐，因此 `rsp & !0x7FFF`
+/// 即当前栈窗口的基址；窗口变化时重置，最小值即可反映该窗口内的栈深度
+/// （`rsp - base`，0x8000 表示栈满）。用户态中断的 rsp 在低地址，按内核地址
+/// 范围过滤。采样精度约 4ms。
+static STACK_WINDOW: [AtomicUsize; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicUsize::new(usize::MAX) }; PerCpu::MAX_CPU_NUM as usize];
+static STACK_MIN_RSP: [AtomicUsize; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicUsize::new(usize::MAX) }; PerCpu::MAX_CPU_NUM as usize];
+
+#[inline]
+fn note_interrupted_kernel_rsp(rsp: usize) {
+    // 只统计内核地址（直接映射区下界），排除来自 ring3 的中断。
+    if rsp < 0xffff_8000_0000_0000 {
+        return;
+    }
+    let cpu = smp_get_processor_id().data() as usize;
+    let (Some(window), Some(min_rsp)) =
+        (STACK_WINDOW.get(cpu), STACK_MIN_RSP.get(cpu))
+    else {
+        return;
+    };
+    let key = rsp & !(0x8000 - 1);
+    if window.load(Ordering::Relaxed) != key {
+        // 换栈：重新开始统计该窗口的最低 rsp。
+        window.store(key, Ordering::Relaxed);
+        min_rsp.store(rsp, Ordering::Relaxed);
+    } else {
+        min_rsp.fetch_min(rsp, Ordering::Relaxed);
+    }
+}
+
+/// 打印所有 CPU 的栈窗口与最低 rsp（深度 = rsp - base）。供 #DF 等零分配路径调用。
+pub fn print_stack_low_rsp_all() {
+    use crate::libs::printk::{
+        emergency_print_hex_noalloc, emergency_print_noalloc, emergency_print_u64_noalloc,
+    };
+    for cpu in 0..STACK_WINDOW.len() {
+        let base = STACK_WINDOW[cpu].load(Ordering::Relaxed);
+        let rsp = STACK_MIN_RSP[cpu].load(Ordering::Relaxed);
+        if base == usize::MAX || rsp == usize::MAX {
+            continue;
+        }
+        emergency_print_noalloc(" stack[cpu");
+        emergency_print_u64_noalloc(cpu as u64);
+        emergency_print_noalloc("] base=");
+        emergency_print_hex_noalloc(base as u64);
+        emergency_print_noalloc(" min_rsp=");
+        emergency_print_hex_noalloc(rsp as u64);
+        // 栈自顶向下增长：深度 = 栈顶(base+0x8000) - rsp；接近 32768 表示耗尽。
+        let depth = (base + 0x8000).saturating_sub(rsp);
+        emergency_print_noalloc(" depth=");
+        emergency_print_u64_noalloc(depth as u64);
     }
 }
 
