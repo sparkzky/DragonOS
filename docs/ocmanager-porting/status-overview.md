@@ -913,23 +913,39 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 
 **下一步**：
 
-1. 在 `commit_journal` / `encode_log_images` 入口记录 `rsp`，并在出口比较 per-CPU 栈水位，
-   得到该路径的真实峰值深度（不依赖 guard）；
+1. 重新制造脏盘（`/up_ocm.sh` 运行中强杀）并复现 #DF，读 `stack[cpuN] depth`：
+   `depth` 接近 32768 → 深调用链耗尽栈，按 2/4 继续；`depth` 很小 → `rsp` 跳变，
+   转而检查 `switch_to` 恢复的 `ArchPCBInfo.rsp` 与信号/ptrace 返回的 TrapFrame；
 2. 复核 guard 页在**任务实际使用的地址别名**上是否真的 not-present（读 PTE 的 present 位，
    而不是用 gdb 读内容）；
 3. 若确认深栈：拆分/降栈（避免大对象、减少内联与递归），而不是简单加大栈；
 4. 同时检查 journal 提交内是否存在 `alloc → reclaim/writeback → 再次提交` 的重入链。
 
-**新增取证能力**（`2ce7dc19`）：`do_double_fault` 现在同时打印 `CR2`，#DF 无需 gdb 即可
-看到级联缺页地址；已用“直接调用处理器”的方式验证输出格式：
+**新增取证能力**（`2ce7dc19`、`3f220926`）：
+
+1. `do_double_fault` 打印 `CR2`，#DF 无需 gdb 即可看到级联缺页地址；
+2. APIC 定时器（250Hz）采样被中断上下文的 `rsp`，按 32K 栈窗口分组维护最低值，
+   #DF 时零分配打印 `stack[cpuN] base=… min_rsp=… depth=…`（`depth` 自栈顶起算，
+   接近 32768 表示该栈耗尽）。
+
+验证（#273，用 gdb 直接调用处理器）：
 
 ```
-[#DF] double fault (IST): err=0x0 cr2=0x27008 rsp=0x0 rip=0x0 -- halted
+[#DF] double fault (IST): err=0x0 cr2=0x20d6d rsp=0x7dd00004 rip=0xffff800340205600
+ stack[cpu0] base=0xffff800001258000 min_rsp=0xffff80000125fcc0 depth=832
+ stack[cpu1] base=0xffff800340098000 min_rsp=0xffff80034009fe28 depth=472 -- halted
 ```
+
+两点观察：
+
+- 空闲栈的 `depth` 只有几百字节，符合预期；真实故障时若 `depth` 接近 32768 即为深栈耗尽，
+  若是很小的值则说明 `rsp` 被直接写坏（跳变）。
+- 上述合成调用的 `CR2` 是**更早一次缺页的残留值**（0x20d6d），印证了 §3.48 中“CR2 可能
+  不代表本次 #DF 的直接原因”的判断。
 
 **复现资产**：`/home/sparkzky/ocm-tars/dirty-repro-2026-10-25.img`（16G，来自 guard 内核 #DF
-停机后强杀的盘；启动即命中根挂载期 journal 重放故障）。注意每次启动都会重放并改变该盘，
-诊断前先复制一份。
+停机后强杀的盘）。注意：每次启动都会重放 journal，实测第二次启动已不再触发 #DF，
+需重新制造脏盘（运行 `/up_ocm.sh` 过程中强杀）才能复现。
 
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
