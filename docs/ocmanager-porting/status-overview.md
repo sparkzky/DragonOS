@@ -1154,6 +1154,42 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
 3. 每次 `docker exec` 都会打印 `WARNING: --criu ignored (criu binary from $PATH is used); do not use`，
    属噪声，不影响命令结果。
 
+### 更新（同日深夜，`eb8f7582` OverlayFS 缺页实现：kafka/sqlite 的"operation not supported"根因之一）
+
+容器内 `mmap` 一个 overlay 上的文件后首次访问，会触发
+`map_pages() has not yet been implemented for filesystem: OverlayFS` panic：
+
+- 在**用户态缺页**上下文里 panic → 整机 park（现场：`do_page_fault →
+  handle_mm_fault → do_fault → OverlayFS::map_pages`）；
+- 在 **syscall 上下文**里 panic 被 `catch_unwind` 吞掉，向上表现为
+  `disk I/O error: operation not supported`（sqlite WAL 的 `-shm` 映射、
+  kafka/JVM 启动都会踩到）。这正是本轮反复出现的
+  `operation not supported` 的直接来源。
+
+根因：`FileSystem::map_pages` 默认实现是 panic，而 OverlayFS 没有自己的
+页缓存（`OvlInode::page_cache()` 恒为 `None`），数据页属于 upper/lower
+的 backing inode。`mmap_effective_file()` 通常会把 VMA 换成 backing 文件，
+但 shared 映射仍可能挂在 overlay 文件上（如 fd 已 close、`private_data`
+变为 `Unused`，而 POSIX 允许映射在关闭后继续有效）。
+
+修复（`eb8f7582`）：
+
+1. `mm/fault.rs` 抽出 `filemap_map_pages_with_cache_owner`，新增
+   `filemap_map_pages_for_inode`，允许显式指定页缓存所属 inode；
+2. `overlayfs/fs.rs` 实现 `map_pages`：从 VMA 文件出发剥离 `MountFSInode`
+   投影拿到 `OvlInode`，再用 `current_realdata_inode()` 定位 backing inode，
+   按其页缓存完成映射；
+3. `VfsDentry` 增加只读 `inode()` 访问器供上述穿透。
+
+验证（#295，12G，单次净启动）：
+
+| 项 | 结果 |
+|---|---|
+| 容器内 sqlite（WAL / DELETE 两种模式） | 连续 5 次插入全部成功（此前必 panic/SIGBUS） |
+| 容器内 sqlite 双连接同库交替写 | 6 次插入全部成功 |
+| C 探针（`mmap` shared + 写回） | 到修复前崩溃，修复后不再 panic（见下方遗留项） |
+| 16 容器启动 | **全部 Up，含此前反复失败的 kafka(JVM) 与 msg-etl** |
+
 ### 仍未闭环（按优先级）
 
 1. **kafka（JVM）偶发启动失败**：bitnami entrypoint 报
