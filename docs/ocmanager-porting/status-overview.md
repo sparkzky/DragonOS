@@ -758,7 +758,7 @@ owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIA
 **后续**：Linux 还把 NMI / #MC 放在 IST 上；本仓库目前只有 #DF。NMI 处理器若需迁到 IST，
 必须先解决它现在依赖 `current_pcb()` 的问题（同样只能用零分配通道或 per-CPU current）。
 
-## 3.46 `kstack_protect`（内核栈 guard page）默认启用评估：暂不启用（2026-10-25）
+## 3.46 `kstack_protect`（内核栈 guard page）默认启用评估：先暂缓、后启用（2026-10-25）
 
 目标：用 guard page 把“栈溢出静默破坏栈底 PCB 槽”（§3.40/§3.43 类故障）变成可定位的缺页。
 
@@ -824,14 +824,16 @@ IPI 解引用已失效的发起者栈帧（UAF）。
 默认内核（#262，未开 guard）净盘回归：7 容器 Up，footstone/msg-etl/sysdiagnose
 健康检查全 200，`mysqld is alive`，迁移全部 RC=0，`poweroff -f` 后 QEMU exit 0。
 
-结论：
+结论（2026-10-25 晚更新）：
 
-1. `kstack_protect` **仍不改为默认开启**：修复解决了已观测的 flush 锁互等，但
-   guard 特性下的**全栈**（`/up_ocm.sh` 七个容器）尚未跑通（一次运行在 15 分钟内
-   未到 `UP_END`，且两 CPU 均处于 idle，原因未定位；可能与脚本重复调用
-   `dragon-docker-start` 有关）。下一步：在干净 guard 内核上、不预先手动启动
-   dockerd，重跑 `/up_ocm.sh` 并定位该次停滞；
-2. 之前“guard page 下 2/2 正常”只覆盖启动路径，本结论修正该记录。
+1. `kstack_protect` 的**全栈**卡点已定位并解决：
+   - `journal_transaction` 在深调用链上构造 4 KiB 栈临时，guard 下触发 #DF（§3.48）；
+     改为堆分配后（`662fc12c`）脏 journal 重放不再 #DF；
+   - `guest-stack-up.sh` 未清理旧 `sdiag` 导致 `docker run` 返回 125，已修。
+   随后 guard 内核下 `/up_ocm.sh` 全流程通过（7 容器 Up、三服务 200、
+   `mysqld is alive`），因此**把 `kstack_protect` 加入默认 features**（`8c9aa9e0`）；
+2. 默认构建（#276）复跑同一验收，结果一致（MDB/RDS/CH/KFK/V_RDS/V_CH/MDB_DB/
+   KFK_OK/ETL/FOOT/SD 全为 0，`poweroff -f` 后 QEMU exit 0）。
 
 ## 3.47 `CURRENT_PCB_DIAG` 首次读取成功（2026-10-25）
 
@@ -947,6 +949,27 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 停机后强杀的盘）。注意：每次启动都会重放 journal，实测第二次启动已不再触发 #DF，
 需重新制造脏盘（运行 `/up_ocm.sh` 过程中强杀）才能复现。
 
+### 3.48.1 根因修复与验证（`662fc12c`）
+
+栈深度探针的结论（§3.47.1 的 30.5K/32K + 本次 #DF）指向**深调用链上的 4 KiB 栈临时**：
+`another_ext4` 的 journal 路径用 `Box::try_new([0; BLOCK_SIZE])` / `Box::try_new(*block)`，
+这两个写法都会先在栈上物化 4 KiB 数组再搬到堆。
+
+修复：新增 `heap_zeroed_block::<N>()` 与 `heap_block_copy(&[u8; N])`，用 `Vec` 预留后在
+堆上填充/复制，覆盖 `encode_log_images`、`encode_commit`、superblock 镜像与
+`write_bytes`。
+
+验证（12G，guard 内核）：
+
+1. 启动后运行 `/up_ocm.sh`，85 秒时 `SIGKILL` 制造脏 journal；
+2. 重启：`ext4: dirty journal detected (RECOVER feature: true), replaying` 之后正常挂载、
+   进入 console，**未再出现 #DF / SOFTIRQ CORRUPT**（修复前同样操作在
+   `encode_log_images` 触发 #DF）；
+3. 同一次启动继续跑 `/up_ocm.sh`：7 容器 Up、三服务健康 200、`mysqld is alive`。
+
+据此 `kstack_protect` 已加入默认 features（`8c9aa9e0`），并在默认构建（#276）上复跑
+同一验收通过。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -966,18 +989,20 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 | `docker commit` 导出层失败 | ext4 符号链接 xattr 读取改为 ENODATA（`8ca49350`，§3.44.2），净盘提交+运行验证通过 |
 | IRQ 独立栈（#DF） | 每 CPU IST 栈 + 门 8 `ist=1` + 零分配停机（`8f6156c9`，§3.45），故障注入验证无三重错误 |
 | TLB shootdown IRQ-off 互等 | 等待锁时服务入站请求 + CSD 指针置空（`99663970`，§3.46.3），guard 内核下 docker 拉起/容器/commit 通过 |
+| journal 路径栈耗尽 | 4 KiB 块改为堆分配（`662fc12c`，§3.48.1），脏 journal 重放不再 #DF |
+| guard page 默认启用 | `kstack_protect` 加入默认 features（`8c9aa9e0`）；默认构建 #276 全栈验收通过 |
 | 大镜像 `docker load` 楔死 / 2-e 挂起 / bash `<(...)` | 随本轮内存与调度修复后未再复现，归入内存破坏类待观察 |
 
 ### 4.2 待办（按优先级）
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 根因范围已收窄到**根挂载期 ext4 journal 提交路径的栈耗尽**：DIAG 显示 30.5K/32K（§3.47）；guard 内核下同一路径直接 #DF 于 `another_ext4::encode_log_images`，rsp 距栈顶 ~0x800（§3.48）。下一步：在内核内记录该路径栈水位峰值 + 复核 guard PTE 的 present 位 |
+| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 根因已定位并修复：ext4 journal 提交路径的 4 KiB 栈临时耗尽 32 KiB 内核栈（§3.47/§3.48），改堆分配后（`662fc12c`）脏 journal 重放不再 #DF。剩余：曾记录的 4G 非 journal 场景未再复测；若再现，按 §3.48 的 `stack[cpuN] depth` 判深栈/跳变 |
 | 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
-| 6 | `kstack_protect` 默认启用 | §3.46：flush 锁互等已修；§3.48：guard 在根挂载期把静默栈溢出变成 #DF（IST 捕获），但全栈仍未跑通，保持默认关闭；待 #1 的栈用量问题解决后重评 |
+| 6 | `kstack_protect` 默认启用 | 已完成：flush 互等修复 + journal 栈临时修复后，guard 下全栈通过，已加入默认 features（`8c9aa9e0`），默认构建 #276 验收通过 |
 
 ## 5. 调试工具资产（多数探针已删除或编译期关闭）
 
