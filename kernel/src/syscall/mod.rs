@@ -209,6 +209,22 @@ impl Syscall {
                         Err(SystemError::ENOSYS)
                     }
                 };
+                // 诊断：定位返回 EOPNOTSUPP 的系统调用（容器内 sqlite/WAL 提交失败取证）。
+                if let Err(e) = &r {
+                    if e.to_posix_errno() == 95 {
+                        static EOPNOTSUPP_LOGS: core::sync::atomic::AtomicUsize =
+                            core::sync::atomic::AtomicUsize::new(0);
+                        if EOPNOTSUPP_LOGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 200
+                        {
+                            log::warn!(
+                                "EOPNOTSUPP from syscall nr={} ({}), pid={:?}",
+                                dispatch_nr,
+                                syscall_number_to_str(dispatch_nr),
+                                ProcessManager::current_pcb().pid()
+                            );
+                        }
+                    }
+                }
                 let rax_value: usize = match &r {
                     Ok(v) => *v,
                     Err(e) => e.to_posix_errno() as i64 as u64 as usize,
