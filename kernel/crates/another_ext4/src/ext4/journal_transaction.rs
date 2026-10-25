@@ -904,7 +904,7 @@ impl JournalTransactionCore {
                 *context.superblock_image,
             )
         };
-        let sb_image = Box::try_new(sb_image).map_err(|_| CommitError {
+        let sb_image = heap_block_copy(&sb_image).map_err(|_| CommitError {
             error: Ext4Error::new(ErrCode::ENOMEM),
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
@@ -959,7 +959,7 @@ impl JournalTransactionCore {
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
-        let mut active_sb_image = Box::try_new(*sb_image).map_err(|_| CommitError {
+        let mut active_sb_image = heap_block_copy(&*sb_image).map_err(|_| CommitError {
             error: Ext4Error::new(ErrCode::ENOMEM),
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
@@ -1016,7 +1016,7 @@ impl JournalTransactionCore {
                 failure: CommitFailure::BeforeCommit,
                 poisoned: false,
             })?;
-        let mut clean_sb_block = Box::try_new(*active_sb_block).map_err(|_| CommitError {
+        let mut clean_sb_block = heap_block_copy(&*active_sb_block).map_err(|_| CommitError {
             error: Ext4Error::new(ErrCode::ENOMEM),
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
@@ -1108,13 +1108,7 @@ impl JournalTransactionCore {
     /// 挂载/日志重放的深层调用链叠加这样的帧曾写穿 32KB 内核栈。Linux
     /// 的块缓冲同样不驻留内核栈。
     fn heap_zero_block() -> Result<Box<[u8; BLOCK_SIZE]>> {
-        let mut v: Vec<u8> = Vec::new();
-        v.try_reserve_exact(BLOCK_SIZE)
-            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
-        v.resize(BLOCK_SIZE, 0);
-        v.into_boxed_slice()
-            .try_into()
-            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))
+        heap_zeroed_block::<BLOCK_SIZE>()
     }
 }
 
@@ -1246,8 +1240,7 @@ fn encode_log_images<'a>(
         .try_reserve_exact(required_log_blocks(all.len(), sb.features)? - 1)
         .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
     for group in all.chunks(per_descriptor) {
-        let mut descriptor =
-            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        let mut descriptor = heap_zeroed_block::<BLOCK_SIZE>()?;
         Header {
             block_type: BlockType::Descriptor,
             sequence,
@@ -1267,8 +1260,7 @@ fn encode_log_images<'a>(
                     .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
             ) == MAGIC
             {
-                let mut escaped =
-                    Box::try_new(*staged.bytes()).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                let mut escaped = heap_block_copy(staged.bytes())?;
                 escaped[..4].fill(0);
                 image = EncodedBlock::Owned(escaped);
                 flags |= FLAG_ESCAPE;
@@ -1315,7 +1307,7 @@ fn encode_log_images<'a>(
 }
 
 fn encode_commit(sb: &Superblock, sequence: u32) -> Result<Box<[u8; BLOCK_SIZE]>> {
-    let mut block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    let mut block = heap_zeroed_block::<BLOCK_SIZE>()?;
     Header {
         block_type: BlockType::Commit,
         sequence,
@@ -1326,6 +1318,30 @@ fn encode_commit(sb: &Superblock, sequence: u32) -> Result<Box<[u8; BLOCK_SIZE]>
         block[16..20].copy_from_slice(&checksum.to_be_bytes());
     }
     Ok(block)
+}
+
+/// 在堆上分配 `N` 字节零填充缓冲，避免 `Box::try_new([0; N])` 先把数组
+/// 物化到内核栈。挂载/日志重放的深层调用链叠加 4 KiB 栈临时会写穿 32 KiB
+/// 内核栈（见 `CURRENT_PCB_DIAG` 现场）。
+fn heap_zeroed_block<const N: usize>() -> Result<Box<[u8; N]>> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(N)
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    v.resize(N, 0);
+    v.into_boxed_slice()
+        .try_into()
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))
+}
+
+/// 在堆上复制 `N` 字节块，避免 `Box::try_new(*src)` 的栈上中转。
+fn heap_block_copy<const N: usize>(src: &[u8; N]) -> Result<Box<[u8; N]>> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(N)
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    v.extend_from_slice(src);
+    v.into_boxed_slice()
+        .try_into()
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))
 }
 
 fn update_superblock(
@@ -1345,7 +1361,7 @@ fn update_superblock(
 }
 
 fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE]) -> Result<()> {
-    let image = Box::try_new(*bytes).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    let image = heap_block_copy(bytes)?;
     device.write_block(&Block::new(id, image))
 }
 
