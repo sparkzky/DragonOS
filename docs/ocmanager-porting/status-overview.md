@@ -1054,6 +1054,24 @@ shootdown，等待 CPU0 ack；CPU0 却卡在 IPI handler 的锁上。这是 §3.
 另外仍可见 `pcache stall: wait_ready Loading exceeded 8s`——页缓存 Loading 页
 完成延迟，可能与上述 IPI/锁问题或块层延迟相关。
 
+### 更新（同日，`162d51c5` 诊断与 liveness 尝试）
+
+1. `CsdFlushTlb` 增加 `holder` 并导出 `TLB_CSD_HOLDER`；**实测死锁时该值为 0**，
+   即 `info` 锁的争用者不是三个已知写入点（init/handler/service）中的任何一个，
+   疑似锁字节被滞留置位或 guard 未释放；
+2. 新增 `libs::spinlock_hook`：`SpinLock` 争用循环每 1024 次调用注册钩子，
+   由 mm 注册“服务 pending shootdown”入口（带递归保护），使任意关中断
+   自旋等待者都能应答 IPI。**实测未能消除该死锁**：CPU1 的 IPI handler 在
+   `remote_flush_tlb_on_ipi → service_pending_inbound_flush` 链上自旋，
+   而 `TLB_CSD_HOLDER=0`；
+3. 带钩子版本（#284）的启动进度：MySQL 就绪 50s、Redis/ClickHouse 立即就绪，
+   之后卡在 Kafka 就绪轮询（`kafka-topics --list`）期间死锁。
+
+结论：这不是“发起者持有目标需要的锁”那么简单，需要检查 CSD 结构体所在内存
+是否被破坏（与 §3.40/§3.43 的栈溢出同源），或 `SpinLockGuard` 在异常路径上
+泄漏。下一步建议：把 CSD 从 per-CPU 堆分配改为静态数组（避免堆内存损坏影响）、
+并在 `SpinLockGuard::drop` 加“释放后仍为 true”的自检。
+
 ### 下一步
 
 1. 用 gdb 判定 CPU0 自旋锁的归属（读 CSD/PerCpuVar 基址比对，或给 SpinLock
