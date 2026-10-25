@@ -477,6 +477,56 @@ impl FileSystem for OverlayFS {
         None
     }
 
+    /// OverlayFS 自身不持有页缓存：文件数据页属于 upper/lower 的 backing inode。
+    ///
+    /// `mmap_effective_file()` 已尽量把 VMA 换成 backing 文件；但 shared
+    /// 映射可能与 overlay 文件绑定（例如 fd 的 private_data 在 close 后
+    /// 变为 `Unused`，而 POSIX 允许映射在 fd 关闭后继续有效）。此时缺页
+    /// 仍会到达这里，必须按 backing inode 的页缓存完成映射，而不是 panic
+    /// 或盲目 SIGBUS。
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> crate::mm::VmFaultReason {
+        let Some(vm_file) = pfm.vm_file().cloned() else {
+            return crate::mm::VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        // 容器/挂载视图下，文件 inode 可能是 `MountFSInode` 投影，
+        // 真正的 overlay inode 在 dentry 上，需要剥掉投影层。
+        let mut cursor = vm_file.inode();
+        let ovl_inode = loop {
+            if let Some(ovl) = cursor.clone().downcast_arc::<OvlInode>() {
+                break ovl;
+            }
+            if let Some(mnt) = cursor.clone().downcast_arc::<MountFSInode>() {
+                cursor = mnt.shared_dentry().inode();
+                continue;
+            }
+            log::error!(
+                "overlayfs: map_pages on unsupported inode: dyn_type={} fs={} inode_id={:?}",
+                core::any::type_name_of_val(cursor.as_any_ref()),
+                cursor.fs().name(),
+                cursor.metadata().map(|m| m.inode_id)
+            );
+            return crate::mm::VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let (backing_inode, _) = match ovl_inode.current_realdata_inode() {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("overlayfs: map_pages resolve backing inode failed: {:?}", error);
+                return crate::mm::VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        };
+        crate::mm::fault::PageFaultHandler::filemap_map_pages_for_inode(
+            pfm,
+            &backing_inode,
+            start_pgoff,
+            end_pgoff,
+        )
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }

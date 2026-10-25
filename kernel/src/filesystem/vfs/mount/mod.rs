@@ -950,6 +950,14 @@ impl VfsDentry {
         self.id
     }
 
+    /// 返回该 dentry 绑定的 inode。
+    ///
+    /// 供需要穿透挂载投影的实现使用（例如 OverlayFS 的缺页路径要拿到
+    /// 投影背后的真实 overlay inode）。
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
     fn is_disconnected(&self) -> bool {
         self.state.lock().disconnected
     }

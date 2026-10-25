@@ -1358,16 +1358,40 @@ impl PageFaultHandler {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
+        Self::filemap_map_pages_with_cache_owner(pfm, None, start_pgoff, end_pgoff)
+    }
+
+    /// 同 [`Self::filemap_map_pages`]，但显式指定页缓存所属的 inode。
+    ///
+    /// 供“文件数据页不在 VMA 文件的 inode 上”的文件系统使用：典型是
+    /// OverlayFS——VMA 绑定的是 overlay inode（无自己的页缓存），
+    /// 真实数据页属于 upper/lower 层的 backing inode。
+    pub unsafe fn filemap_map_pages_for_inode(
+        pfm: &mut PageFaultMessage,
+        inode: &Arc<dyn crate::filesystem::vfs::IndexNode>,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        Self::filemap_map_pages_with_cache_owner(pfm, Some(inode), start_pgoff, end_pgoff)
+    }
+
+    unsafe fn filemap_map_pages_with_cache_owner(
+        pfm: &mut PageFaultMessage,
+        cache_owner: Option<&Arc<dyn crate::filesystem::vfs::IndexNode>>,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = match file.inode().page_cache() {
+        let cache_inode = cache_owner.cloned().unwrap_or_else(|| file.inode());
+        let page_cache = match cache_inode.page_cache() {
             Some(cache) => cache,
             None => {
                 // 文件没有页面缓存，可能是不支持内存映射的设备文件
                 log::warn!(
                     "filemap_map_pages: file has no page cache, inode type: {}",
-                    crate::libs::name::get_type_name(&file.inode())
+                    crate::libs::name::get_type_name(&cache_inode)
                 );
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
