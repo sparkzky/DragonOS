@@ -981,6 +981,27 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 据此 `kstack_protect` 已加入默认 features（`8c9aa9e0`），并在默认构建（#276）上复跑
 同一验收通过。
 
+## 3.49 次级缺口评估（AIO / fallocate / sysctl / ptrace / FAT / DAC，2026-10-25）
+
+全栈验收期间内核实际拒绝的系统调用只有 4 次（§3.44）：
+
+| 调用 | 次数 | 调用方与回退 |
+|---|---|---|
+| `io_setup`(206) | 2 | mysqld（InnoDB AIO）；报不支持后回退同步 IO，服务正常 |
+| `membarrier`(324) | 1 | 用户态运行时探测；未实现即视为无此能力，功能不受影响 |
+| `quotactl`(179) | 1 | 一次性探测（busybox/容器启动脚本），无后续依赖 |
+
+AIO/fallocate/sysctl/ptrace/FAT/DAC 在本轮 OCManager + gVisor 路径中**没有被触发**。
+
+结论：这些缺口目前不构成阻塞，且其中若干项（尤其 `membarrier` 的 expedited 语义）若只实现
+“返回成功”而不做跨核屏障，会**静默削弱** Linux 语义——属于禁止的 workaround。因此：
+
+1. 不预先实现、不返回假成功；遇到 `ENOSYS` 的真实调用方时再按 Linux 6.6 语义实现，
+   并用针对性用例验证（如 membarrier 需验证注册命令返回 0 且 expedited 命令确实发出 IPI 屏障）；
+2. 触发条件记录：任何服务/测试出现 `Unsupported syscall ID: N` 且调用方无回退、或
+   gVisor/dunitest 对应用例失败，即从该调用开始补；
+3. `/proc/net/tcp` 为空（§3.42.3 #4）同样按“有消费者时再补”的方式记录。
+
 ## 4. 当前状态与待办（2026-10-25 刷新）
 
 ### 4.1 已闭环（本轮及上一轮）
@@ -1010,7 +1031,7 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 |---|---|---|
 | 1 | ~~内存破坏类挂死~~（已闭环） | 根因 = ext4 journal 提交路径的 4 KiB 栈临时耗尽内核栈（§3.47/§3.48）；改堆分配（`662fc12c`）后，12G 与 4G 的脏 journal 重放均不再 panic/#DF（§3.43.5、§3.48.1），guard page 已默认开启 |
 | 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
-| 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
+| 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | 评估完成（§3.49）：本轮仅 io_setup/membarrier/quotactl 被拒且均有回退，其余未被触发；按“有真实调用方再实现”执行，禁返回假成功 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
 | 5 | 脏 journal 重放的健壮性 | 与 #1 同源；建议 #1 修复后回归 |
 | 6 | `kstack_protect` 默认启用 | 已完成：flush 互等修复 + journal 栈临时修复后，guard 下全栈通过，已加入默认 features（`8c9aa9e0`），默认构建 #276 验收通过 |
