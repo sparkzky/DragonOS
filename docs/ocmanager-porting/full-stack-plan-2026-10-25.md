@@ -68,10 +68,44 @@ TMS 配置里用服务名互访（如 `ip://task-manager:50042`、`ip://gateway:
 4. Kafka/Redis/ClickHouse/MySQL 数据面在服务启动后仍正常（produce/consume 或查询）；
 5. 关机后 `Filesystem state: clean`（或 QEMU exit 0）。
 
-## 进度
+## 进度（2026-10-25 深夜，#290）
 
-- [x] 镜像可用性盘点；TMS 7 镜像与 frontend 镜像构建中
-- [ ] guest 内加载镜像
-- [ ] 网络模型验证（bridge vs host）
-- [ ] 16 容器启动
-- [ ] 端到端验收
+- [x] 镜像可用性盘点；TMS 7 镜像与 frontend 镜像构建
+- [x] guest 内加载镜像（8/8）
+- [x] 网络模型验证：**bridge + 容器名 DNS**（`getent hosts <svc>` 可用），
+      因此配置里的服务名零改动
+- [x] 16 容器启动：`full-stack-up.sh` 串行版一次跑通，串行就绪探活约 10 分钟
+- [x] 端到端验收（见 `status-overview.md` §3.50 的表）：
+      前端 / 三个健康端点 / JWT 登录 / GetCurrentUser / ListProjects /
+      msg-etl 指标 / sysdiagnose 命令列表 / api→task-manager /
+      api→asset-manager 写入 + 唯一约束 / 120 次并发 exec 压测
+- [ ] kafka(JVM) 偶发起不来 → msg-etl 连带退出（`status-overview.md` §3.50 残留 1）
+- [ ] asset-manager 第二次 SQLite 写入报 `operation not supported`（残留 2）
+
+## 验收脚本口径（务必按此写，否则会得到「空响应」的假失败）
+
+1. **变更类 api 端点需要网关 HMAC 签名**。即使容器里
+   `TMS_API_GW_HMAC_STRICT=false`，只要 `TMS_API_GW_HMAC_SECRET` 非空，
+   `POST /api/v1/{assets/add,batch_add,remove,ops_tasks/publish,cancel,
+   artifacts/upload,remove,agents/upgrade,restart}` 仍会被校验：
+
+   ```
+   canonical = METHOD "\n" PATH "\n" X-User-Name "\n" X-User-Role "\n"
+               TIMESTAMP "\n" NONCE "\n" SHA256_HEX(body)
+   X-Signature = hex(HMAC-SHA256(TMS_API_GW_HMAC_SECRET, canonical))
+   ```
+
+   另需 `X-User-Name`（必填）、`X-User-Role`、`X-Signature-Timestamp`（Unix 秒，
+   偏差 >300s 拒绝）、`X-Signature-Nonce`（10 分钟内不可重复）。
+   **时间戳必须用 guest 时钟**：guest 是 UTC，宿主时区与之相差 8 小时。
+2. footstone 登录：`User/IdentifyAccount`，字段是 **`loginname`**（不是 account），
+   密码传 `hex(SHA512("Admin123456@"))`；服务端再做 `SHA512(password + salt)`。
+3. `ListProjects` 的分页在 pb 里是嵌套的 **`page_request`**：
+   `{"page_request":{"page_size":10,"page_number":1}}`。
+4. 容器镜像内**没有 curl**；用 `docker exec clickhouse wget` 发起请求。
+   wget 对非 2xx 会丢弃响应体并以退出码 6 结束，取证必须加
+   `--content-on-error`（否则「空响应」其实是 401/400）。
+5. `docker exec` 每次都会打印
+   `WARNING: --criu ignored (criu binary from $PATH is used); do not use`，属噪声。
+6. 容器退出后其 DNS 记录立即消失，`getent hosts <name>` 失败时要先
+   `docker ps -a` 确认容器是否还在运行。
