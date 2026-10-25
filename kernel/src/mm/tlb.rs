@@ -18,7 +18,7 @@
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
-use core::{hint::spin_loop, sync::atomic::AtomicBool};
+use core::{hint::spin_loop, sync::atomic::AtomicBool, sync::atomic::AtomicU32};
 
 use alloc::sync::Arc;
 #[allow(unused_imports)]
@@ -159,6 +159,10 @@ pub struct CsdFlushTlb {
     info: SpinLock<Option<*const FlushTlbInfo>>,
     /// Set to true by the target CPU upon completion.
     done: AtomicBool,
+    /// 诊断：当前持 `info` 锁的 CPU（0 表示无人持有，否则 CPU+1）。
+    ///
+    /// 死锁现场（IPI handler 自旋在 `info` 锁）无法打印，故落盘供 gdb 读取。
+    holder: AtomicU32,
 }
 
 // SAFETY: The pointer itself is unsafe, but it points to an object on the initiator's stack,
@@ -168,12 +172,20 @@ unsafe impl Sync for CsdFlushTlb {}
 #[cfg(target_arch = "x86_64")]
 unsafe impl Send for CsdFlushTlb {}
 
+/// 诊断：当前持 CSD `info` 锁的 CPU（0=无，否则 CPU+1）。
+///
+/// CSD 结构体内偏移由 rustc 决定、gdb 难以可靠推算，故导出独立静态量；
+/// 死锁时用 gdb 读该符号即可知道持锁者。
+#[unsafe(no_mangle)]
+pub static TLB_CSD_HOLDER: AtomicU32 = AtomicU32::new(0);
+
 #[cfg(target_arch = "x86_64")]
 impl CsdFlushTlb {
     const fn new() -> Self {
         Self {
             info: SpinLock::new(None),
             done: AtomicBool::new(true),
+            holder: AtomicU32::new(0),
         }
     }
 }
@@ -212,7 +224,12 @@ fn service_pending_inbound_flush() {
     // handler 看到 None 会直接返回，不会解引用悬垂指针。
     let info_ptr = {
         let mut guard = csd.info.lock();
-        guard.take()
+        csd.holder.store(cpu.data() + 1, Ordering::Release);
+        TLB_CSD_HOLDER.store(cpu.data() + 1, Ordering::Release);
+        let taken = guard.take();
+        csd.holder.store(0, Ordering::Release);
+        TLB_CSD_HOLDER.store(0, Ordering::Release);
+        taken
     };
     let Some(info_ptr) = info_ptr else {
         return;
@@ -232,6 +249,21 @@ fn acquire_flush_tlb_lock() -> SpinLockGuard<'static, ()> {
         service_pending_inbound_flush();
         core::hint::spin_loop();
     }
+}
+
+/// 给 `SpinLock` 争用循环用的入口，带递归保护。
+///
+/// service 内部会取 CSD 的 `info` 自旋锁；若该锁争用，其等待循环又会调用本
+/// 入口，需直接返回，避免无限递归。
+#[cfg(target_arch = "x86_64")]
+fn try_service_inbound_flush_from_spin() {
+    static IN_SERVICE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if IN_SERVICE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    service_pending_inbound_flush();
+    IN_SERVICE.store(false, Ordering::Release);
 }
 
 /// Initialize this module. Must be called after `PerCpu::init()`.
@@ -255,6 +287,8 @@ pub fn tlb_init() {
         unsafe {
             CSD_FLUSH_TLB = Some(PerCpuVar::new(csds).expect("PerCpuVar length mismatch"));
         }
+        // 让任意关中断自旋等待者都能应答 shootdown（见 libs::spinlock_hook）。
+        crate::libs::spinlock_hook::set_hook(try_service_inbound_flush_from_spin);
     }
 }
 
@@ -377,7 +411,15 @@ pub fn remote_flush_tlb_on_ipi() {
         let csd = unsafe { csd_flush_tlb().force_get(cpu) };
         let info_ptr: *const FlushTlbInfo = {
             let guard = csd.info.lock();
-            match *guard {
+            csd.holder.store(cpu.data() + 1, Ordering::Release);
+        TLB_CSD_HOLDER.store(cpu.data() + 1, Ordering::Release);
+            let found = match *guard {
+                Some(p) => Some(p),
+                None => None,
+            };
+            csd.holder.store(0, Ordering::Release);
+        TLB_CSD_HOLDER.store(0, Ordering::Release);
+            match found {
                 Some(p) => p,
                 None => {
                     // Should not happen; defensively set done to avoid initiator deadlock
@@ -434,7 +476,11 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
             {
                 let mut g = csd.info.lock();
+                csd.holder.store(cpu.data() + 1, Ordering::Release);
+        TLB_CSD_HOLDER.store(cpu.data() + 1, Ordering::Release);
                 *g = Some(info as *const FlushTlbInfo);
+                csd.holder.store(0, Ordering::Release);
+        TLB_CSD_HOLDER.store(0, Ordering::Release);
             }
             csd.done.store(false, Ordering::SeqCst);
         }
@@ -489,7 +535,11 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             }
             // Clean up CSD slot to prevent misuse
             let mut g = csd.info.lock();
+            csd.holder.store(cpu.data() + 1, Ordering::Release);
+        TLB_CSD_HOLDER.store(cpu.data() + 1, Ordering::Release);
             *g = None;
+            csd.holder.store(0, Ordering::Release);
+        TLB_CSD_HOLDER.store(0, Ordering::Release);
         }
     }
 
