@@ -2,7 +2,7 @@
 stty -tostop
 dragon-docker-start
 # 幂等：清理上次运行残留的容器（数据都在容器内，删掉即干净重建）
-docker rm -f mdb rds ch kfk foot etl >/dev/null 2>&1
+docker rm -f mdb rds ch kfk foot etl sdiag >/dev/null 2>&1
 docker run -d --name mdb --network host --entrypoint bash mysql:8.0.35 -c 'mysqld --initialize-insecure --user=root; exec mysqld --user=root' >/dev/null 2>&1; echo MDB=$?
 docker run -d --name rds --network host redis:7.2.3-alpine >/dev/null 2>&1; echo RDS=$?
 docker run -d --name ch --network host clickhouse/clickhouse-server:23.8.8.20 >/dev/null 2>&1; echo CH=$?
