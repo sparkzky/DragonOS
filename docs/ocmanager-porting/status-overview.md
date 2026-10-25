@@ -1192,22 +1192,21 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
 
 ### 仍未闭环（按优先级）
 
-1. **kafka（JVM）偶发启动失败**：bitnami entrypoint 报
-   `libfile.sh: line 41: echo: write error: Operation not supported` 后 `Exited(1)`；
-   `docker start` 复起时 java 出现大量 `No mapped vma` 用户态缺页（pid 7525，
-   rip 在 JIT 区）。kafka 不在时 msg-etl 因 broker 解析失败退出
-   （`lookup kafka on 127.0.0.11:53: server misbehaving`）。
-   同一次运行的 #286 上两者均 Up，属状态相关。
-2. **SQLite 第二次写入报 `disk I/O error: operation not supported`**：
-   - 同进程第一次 `assets/add` 成功落库；第二次新插入必现失败，
-     重复 uuid 则是 `UNIQUE constraint failed`（说明读路径正常）；
-   - `asset-manager` 的 CRL 周期重建也曾在运行数分钟后以此错误失败；
-   - 内核侧新增的 EOPNOTSUPP 系统调用追踪计数为 **0**，且用静态探针在
-     容器内 `/data` 与 guest `/root` 上验证
-     `open/pwrite/ftruncate/mmap(offset≠0)/msync/fdatasync/fallocate/
-     fcntl(F_SETLK,F_GETLK)/fsync(dir)` 全部成功 ——
-     该 errno 并非来自这些系统调用的返回值，需要继续在 sqlite VFS
-     （`xShmMap`/`xShmLock`/`xFileControl`）语义上定位。
+1. **asset-manager 写入仍报 `disk I/O error: operation not supported`**
+   （`eb8f7582` 之后才可精确定位为**非** overlay mmap 问题）：
+   - 同一容器、同一 bind mount 路径（`/data/ocm/asset-manager`）下，
+     独立 sqlite 程序（同驱动 mattn/go-sqlite3、同 DSN、WAL 与 DELETE）
+     写入完全正常；双连接交替写也正常；
+   - 删库重启后**第一次** `assets/add` 也失败，排除"历史 WAL/-shm 状态"；
+   - 与 **`pcache stall: wait_ready Loading exceeded Ns`** 强相关
+     （本轮 8 次，最长 8s，同一 pid 持续等待）——怀疑某个页长时间滞留在
+     `Loading` 状态，导致写/提交路径拿到错误并映射为 EOPNOTSUPP；
+   - 内核侧 EOPNOTSUPP 系统调用追踪计数为 0，说明该 errno 不是 syscall
+     返回值，而是内核内部错误路径经 VFS 冒泡。
+   下一步：在 `PageCache` 的 `Loading` 状态机与写回错误路径上加诊断
+   （记录 pid/ino/pgoff/状态迁移），并抓 `pcache stall` 的 pid 归属。
+2. **kafka(JVM)/msg-etl**：OverlayFS 缺页修复后本轮 16 容器全部 Up，
+   但历史上曾偶发失败，需要长跑观察确认不再复现。
 3. `docker ps` 中容器退出后其 DNS 记录立即消失，导致依赖方
    `getent hosts` 失败——这是 docker 行为，排查时需要先确认容器是否还在运行。
 
