@@ -661,6 +661,17 @@ c. **CSD 等待无 liveness 保护**：目标核 panic 停车后，任何 shootd
 owner 反查用原子标志单层化），保证下次命中时 `CURRENT_PCB_DIAG` 一定可读、且不会因诊断
 本身无限套娃。
 
+### 3.43.5 2026-10-25 晚：根因修复后 4G 终验通过
+
+`kstack_protect` 默认开启 + journal 栈临时改堆分配（`662fc12c`）后，重做「4G + 脏 journal」：
+
+1. 4G 启动 → 运行 `/up_ocm.sh` → 85 秒时 `SIGKILL` 制造脏 journal；
+2. 再次以 4G 启动：日志出现 `ext4: dirty journal detected (RECOVER feature: true), replaying`
+   后**正常挂载并进入 console**，无 panic / `SOFTIRQ CORRUPT` / #DF。
+
+这是此前“4G 必现”的同一路径；结合 §3.47/§3.48 的栈分析，可确认该故障与 journal 提交路径
+的栈耗尽同源，已由堆分配修复消除。
+
 ## 3.44 OCManager 全栈功能验收（2026-10-25，内核 #253）
 
 净盘启动后不再只做“进程 Up + 健康检查”，而是对每条业务链路做真实 API 调用
@@ -997,7 +1008,7 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 
 | # | 项 | 现状与下一步 |
 |---|---|---|
-| 1 | **内存破坏类挂死**（脏 journal panic 与非 6G 内存同源） | 根因已定位并修复：ext4 journal 提交路径的 4 KiB 栈临时耗尽 32 KiB 内核栈（§3.47/§3.48），改堆分配后（`662fc12c`）脏 journal 重放不再 #DF。剩余：曾记录的 4G 非 journal 场景未再复测；若再现，按 §3.48 的 `stack[cpuN] depth` 判深栈/跳变 |
+| 1 | ~~内存破坏类挂死~~（已闭环） | 根因 = ext4 journal 提交路径的 4 KiB 栈临时耗尽内核栈（§3.47/§3.48）；改堆分配（`662fc12c`）后，12G 与 4G 的脏 journal 重放均不再 panic/#DF（§3.43.5、§3.48.1），guard page 已默认开启 |
 | 2 | IRQ 独立栈（Linux IST） | #DF 已完成（§3.45）；NMI / #MC 未迁到 IST（它们的处理器仍依赖 `current_pcb()`，需先改为零分配或 per-CPU current） |
 | 3 | 次级缺口：AIO / fallocate / sysctl / ptrace / FAT / DAC | AIO 已确认 mysqld 可回退；其余未动 |
 | 4 | `/proc/net/tcp` 为空 | `procfs/net` 仅注册 arp/protocols，缺 socket 全局表 |
