@@ -585,6 +585,12 @@ impl CpuRunQueue {
             }
 
             spins += 1;
+            // 本锁在关中断下自旋：若此时有 TLB shootdown 发往本 CPU，发起方
+            // 会一直等 ack，而本 CPU 的 IRQ 被关，双方互等直到本锁 spinout。
+            // 与 `SpinLock` 的争用钩子一致，周期性就地服务入站请求。
+            if spins & 1023 == 0 {
+                crate::mm::tlb::service_inbound_flush_from_spin();
+            }
             if spins >= 1_000_000 {
                 let caller = Location::caller();
                 panic!(
