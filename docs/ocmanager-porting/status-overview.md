@@ -1072,6 +1072,34 @@ shootdown，等待 CPU0 ack；CPU0 却卡在 IPI handler 的锁上。这是 §3.
 泄漏。下一步建议：把 CSD 从 per-CPU 堆分配改为静态数组（避免堆内存损坏影响）、
 并在 `SpinLockGuard::drop` 加“释放后仍为 true”的自检。
 
+### 更新（同日，`713fd588` 锁地址诊断：争用锁已定位到堆/percpu 区）
+
+给 `SpinLock` 的争用循环接入“记录锁地址”钩子（`SPIN_LOCK_ADDR` /
+`SPIN_CONTENDED`，均 `#[unsafe(no_mangle)]`，gdb 直读）。全栈脚本再次挂死
+时的现场：
+
+| 观测 | 值 |
+|---|---|
+| `SPIN_LOCK_ADDR` | `0xffff800340007020`（直接映射/堆区，**非**静态锁） |
+| `SPIN_CONTENDED` | `0x7f20b2` ≈ 831 万次争用（长期高频争用，不是偶发） |
+| CPU0 PC | `flush_tlb_multi`（等 ack） |
+| CPU1 PC | `service_pending_inbound_flush`（在 `info` 锁上自旋） |
+| `TLB_CSD_HOLDER` | 0 |
+
+结论修正：争用的确实是 CSD 的 `info` 锁（地址位于 percpu/CSD 分配的堆区，
+与 CPU1 栈 `0xffff800340068000` 同一区域），但**持锁者不是 init/handler 的
+正常临界区**——`holder` 置位到清零之间只有一次指针读写，不可能滞留。
+因此高度怀疑两种之一：
+
+1. `SpinLockGuard` 在该路径上被 `mem::forget`/异常返回泄漏（需在 `Drop` 里
+   加“释放后仍为 true”自检 + 记录释放者 PC）；
+2. CSD 结构体所在内存被相邻写越界破坏（§3.40/§3.43 栈溢出同源）。
+
+正因如此，**不建议继续在现有 CSD 协议上打补丁**；下一步直接改为静态
+per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
+永不复用的静态 `FlushTlbInfo` 槽），IPI handler 全程无锁；同时在
+`SpinLockGuard::drop` 增加释放后自检以证伪/证实泄漏。
+
 ### 下一步
 
 1. 用 gdb 判定 CPU0 自旋锁的归属（读 CSD/PerCpuVar 基址比对，或给 SpinLock
