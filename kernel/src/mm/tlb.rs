@@ -256,7 +256,7 @@ fn acquire_flush_tlb_lock() -> SpinLockGuard<'static, ()> {
 /// service 内部会取 CSD 的 `info` 自旋锁；若该锁争用，其等待循环又会调用本
 /// 入口，需直接返回，避免无限递归。
 #[cfg(target_arch = "x86_64")]
-fn try_service_inbound_flush_from_spin() {
+fn try_service_inbound_flush_from_spin(_locked_spin: usize) {
     static IN_SERVICE: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     if IN_SERVICE.swap(true, Ordering::AcqRel) {
