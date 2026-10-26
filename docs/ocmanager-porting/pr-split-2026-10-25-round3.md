@@ -133,3 +133,46 @@ JVM/kafka 的预分配后写入都会命中；`cp` 出来的副本（新 inode�
    保持有序发布的写入/转换路径修复。
 4. 另记录一个独立缺口（与上述 PR 无关）：**overlayfs 未实现 `fallocate`**，
    容器内 `fallocate` 返回 `EOPNOTSUPP`；sqlite 可容忍，但值得单独跟进。
+
+## 7. 重新打开后的调整与验证（2026-10-26 夜）
+
+两个 PR 被重新打开（它们对 OCManager 的运转是必要的），按评审意见重做后各做了
+独立验证：
+
+### 7.1 #2568 重做（`1ad2ac7b`，已 force-push）
+
+放弃"在 overlay inode 上做页映射"的方案，保留"VMA 绑定真实 backing 文件"的设计：
+
+1. `mmap_effective_file()`：overlay 文件失去 private_data（共享映射比 fd 活得久 →
+   `EBADF`）时，用**原始访问标志**打开当前真实 inode 并返回该 backing 文件；
+   真实 inode 只在**建映射那一刻**解析一次，copy-up 不会切换已有映射。
+2. `OverlayFS::map_pages()`：万一仍有映射落到这里，返回 `VM_FAULT_SIGBUS` 并打
+   一次诊断，替代 trait 默认的 `panic!`（用户态缺页上下文会停机、syscall 上下文
+   会变成 `EOPNOTSUPP`）。
+
+验证（端口分支 + 该补丁，移除旧的 map_pages 实现）：16/16 容器 Up，无
+`page fault on a mapping bound to the overlay inode` 诊断，sqlite 写入与三次
+`assets/add` 均成功。
+
+### 7.2 #2569 的调查结论（建议关闭，补丁不采用）
+
+- 端口分支缺的是 **master 已有的回退**：
+  `kernel/src/filesystem/ext4/inode.rs` 把
+  `create_delalloc_extent_node_pool_authorized()` 的 `Err(ENOTSUP)` 转成
+  `return Ok(None)`（回退 eager 分配）。端口分支写的是
+  `Err(error) => return Err(SystemError::from(error).into())`，于是
+  "尾部 unwritten extent"导致的池构建失败直接冒泡成 `EOPNOTSUPP`。
+- 实验证明：在端口分支上**回退本 PR 的 ext4 补丁**、只加上述 7 行回退，
+  启动 16 容器后连续三次 `assets/add` 全部 `code:OK`（id=1/2/3），
+  无 `operation not supported`。即：应用侧故障由该回退完全修好，ext4 补丁不需要。
+- master 侧复核：容器内 `fallocate(mode 0)` 在 ext4 bind mount 上成功、
+  随后 `pwrite` 全部成功；sqlite 连续 5 次插入成功；未出现 overlay 缺页 panic。
+- 遗留候选（需要可复现基线才动手）：提交时 `RetryableNotPublished(ENOTSUP)`
+  （池建立时尾部干净、之后 `fallocate` 引入 unwritten 尾）仍需"退役池 + 回退 eager"，
+  涉及 `DelallocAppendMapperAuthority` 的传递与有序发布（payload → extent → size）。
+
+### 7.3 对端口分支的最小修复清单
+
+1. 补 `Err(ENOTSUP) => return Ok(None)` 回退（7 行，直接对齐 master）；
+2. 采用 #2568 的新写法（或直接 rebase 到含 #2446/#2449/#2452 的 master）；
+3. 之后 OCManager 全栈可在不改动 ext4 语义的前提下运行。
