@@ -1839,8 +1839,12 @@ impl Ext4 {
         }
         let home = super::rw::MetadataIo::transaction(self, transaction)
             .allocate_initialized_data(inode_ref, Box::new([0; BLOCK_SIZE]))?;
-        let mut extent = Extent::new(iblock, home, 1);
-        extent.mark_unwritten();
+        // 这是写入路径上的块分配：块已写零，紧接着就会写入真实数据，
+        // 因此直接发布为 **written**。标记 unwritten 会让该 inode 的尾部
+        // extent 变成"未写"，后续 append 在
+        // `extent_right_spine_projection` 里被 ENOTSUP 拒绝
+        // （本实现没有"未写→已写"的转换路径）。
+        let extent = Extent::new(iblock, home, 1);
         self.transaction_insert_allocated_extent(transaction, inode_ref, &extent)?;
         self.transaction_stage_inode_with_csum(transaction, inode_ref)?;
         Ok(home)
