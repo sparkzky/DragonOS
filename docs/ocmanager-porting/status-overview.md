@@ -1211,6 +1211,23 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
    - 注意：修复前创建的、尾部已有 unwritten extent 的旧文件仍会失败
      （本实现无转换路径）；删除/重建这些文件即可。启动早期仍能看到
      一次 extent.rs:636 的 ENOTSUP，来自这类历史文件，不影响新写入。
+### 最终验收（#309，含 unwritten extent 修复，单次净启动）
+
+| 项 | 结果 |
+|---|---|
+| 容器 | 16/16 `Up`（含 kafka、msg-etl） |
+| 并发压测 | 8 容器 × 10 轮 `docker exec` → `STRESS_OK` |
+| 前端 | `GET http://frontend/` → `<!DOCTYPE html>` |
+| 健康 | footstone / msg-etl / sysdiagnose 全部 `{"status":"ok"}` |
+| 登录 | `loginname=admin` → `jwt_token`（296 字符） |
+| 鉴权 | `GetCurrentUser` → `success:true` |
+| 项目 | `ListProjects`（`page_request`）→ 「默认」项目 |
+| 指标 | `Metrics/ListMetricsData` → `success:true` |
+| sysdiagnose | `Project/ListGlobalCmds` → 内置命令列表 |
+| api→task-manager | `POST /api/v1/ops_tasks/list` → `code:OK` |
+| api→asset-manager | `assets/add` ×3 → `code:OK`（id=1/2/3）；重复 uuid → `UNIQUE constraint failed` |
+| 关机 | `busybox poweroff -f` → QEMU exit 0 |
+
 2. **kafka(JVM)/msg-etl**：OverlayFS 缺页修复后本轮 16 容器全部 Up，
    但历史上曾偶发失败，需要长跑观察确认不再复现。
 3. `docker ps` 中容器退出后其 DNS 记录立即消失，导致依赖方
