@@ -1,0 +1,96 @@
+# PR 拆分记录（2026-10-25 第三轮）
+
+## 1. 范围与基线
+
+- **来源分支**：`ocmanager-porting-2026-10`（主 worktree `/home/sparkzky/DragonOS-ocmanager`）
+- **起点**：`7d937ec0`（上一轮拆分记录 `pr-split-2026-10-25-round2.md` 之后的第一个提交）
+- **本次范围**：`7d937ec0..bf76301d`（即上次拆分之后新增的全部提交）
+- **拆分基线**：`origin/master` = `45754bdc`
+- **独立 worktree**：`/home/sparkzky/DragonOS-pr-r20`
+  （每个拆分都从 `origin/master` 新建分支，未触碰主 worktree 的工作树与提交历史）
+- **要求**：每个提交带 `Signed-off-by`；每条分支 `make kernel` 与
+  `cargo +nightly-2026-02-24 fmt --all -- --check` 通过后才 push + `gh pr create`
+
+## 2. 拆分结果
+
+| # | 修复 | 源提交 | PR | 分支 | 分支提交 | 状态 |
+|---|---|---|---|---|---|---|
+| 1 | OverlayFS 实现 `map_pages`（按 backing inode 页缓存完成缺页） | `eb8f7582` | [#2568](https://github.com/DragonOS-Community/DragonOS/pull/2568) | `fix/overlayfs-map-pages` | `e1d6bd61` | Open |
+| 2 | ext4 不再把"写路径新块"与"有效区间预分配块"标为 unwritten | `cf2ed782` | [#2569](https://github.com/DragonOS-Community/DragonOS/pull/2569) | `fix/ext4-unwritten-extent-write` | `b0ab5744` | Open |
+
+两个 PR 基于 `origin/master` 且**互不依赖**，可独立评审/合入。
+
+## 3. 逐项说明
+
+### 3.1 #2568 OverlayFS `map_pages`
+
+**问题**：OverlayFS 没有实现 `FileSystem::map_pages`，默认实现直接 `panic!`：
+
+- 用户态缺页上下文 → 整机 park（`do_page_fault → handle_mm_fault → do_fault →
+  OverlayFS::map_pages`）；
+- syscall 上下文 → panic 被 `catch_unwind` 吞掉，上层表现为
+  `disk I/O error: operation not supported`（sqlite `SQLITE_IOERR_WRITE` +
+  errno 95；JVM/kafka 启动同样命中）。
+
+**根因**：OverlayFS 自身不持有页缓存（`OvlInode::page_cache()` 恒为 `None`），
+数据页属于 upper/lower 的 backing inode。`mmap_effective_file()` 通常会把 VMA
+换成 backing 文件，但 shared 映射仍可能挂在 overlay 文件上（如 fd 已 close、
+`private_data` 变为 `Unused`，而 POSIX 允许映射继续有效）。
+
+**改动**：
+
+- `mm/fault.rs`：把 `filemap_map_pages` 抽成按"页缓存归属 inode"参数化的实现，
+  新增 `filemap_map_pages_for_inode`；
+- `overlayfs/fs.rs`：实现 `map_pages`——从 VMA 文件剥掉 `MountFSInode` 投影拿到
+  `OvlInode`，用 `current_realdata_inode()` 定位 backing inode，按其页缓存映射；
+  无法解析时返回 SIGBUS 并打印诊断（不再 panic）；
+- `vfs/mount/mod.rs`：`VfsDentry` 增加只读 `inode()` 访问器。
+
+**分支适配**：无冲突，直接 apply。**验证**：编译/fmt 通过；DragonOS 16 容器下
+容器内 sqlite（WAL 与 DELETE 两种模式）重复写入成功、kafka/msg-etl 正常启动、
+不再出现该 panic。
+
+### 3.2 #2569 ext4 unwritten extent
+
+**问题**：写路径 `transaction_extent_query_or_create` 与
+`preallocate_range_batch` 把所有新分配块标成 unwritten，而本实现没有
+"未写→已写"转换：`extent_right_spine_projection` 一旦遇到尾部 unwritten extent
+就返回 ENOTSUP，于是文件第一次成长后，后续 append 永久失败
+（`write(2)` → `EOPNOTSUPP`）。sqlite 的 `posix_fallocate`+`pwrite`、
+JVM/kafka 的预分配后写入都会命中；`cp` 出来的副本（新 inode、written extent）正常。
+
+**改动**：
+
+- 写路径：新块已由 `allocate_initialized_data` 写零、随即写入真实数据 →
+  直接发布为 **written**；
+- `fallocate`：新增 `preallocate_range_batch_initialized(…, initialized_upto)`——
+  落在"本次操作后属于文件有效数据"区间内的块（已写零）标 written；
+  超出该区间（`FALLOC_FL_KEEP_SIZE` 越过 EOF）仍保持 unwritten，
+  维持 e2fsck 的 inode 尺寸约束；
+- `ext4/inode.rs`：mode 0 传 `end`，KEEP_SIZE 传当前 size；
+- 原 `preallocate_range_batch()` 保留（全 unwritten 语义）。
+
+**分支适配**：`extent.rs` 冲突——上游用 `try_filled_bytes(0)?` 分配零块，
+保留上游写法，只去掉 `mark_unwritten()`（注释改为英文）。
+**验证**：编译/fmt 通过；DragonOS 16 容器下 api→asset-manager 连续三次
+`assets/add` 全部 `code:OK`（id=1/2/3），重复 uuid 返回
+`UNIQUE constraint failed`，不再出现 `operation not supported`。
+
+## 4. 跳过项及原因
+
+| 来源提交 | 内容 | 原因 |
+|---|---|---|
+| `ada1c760` | 定位 EOPNOTSUPP 来源的低噪诊断（Ext4Error 创建点、journal flush 拒绝点、PageCache 写回/Loading 归属、syscall 表分派打印） | 纯取证设施，按前两轮口径留在分支，不进上游 |
+| `bc2ef7b8`、`7caa7d39`、`467d39d3`、`9c492de8`、`bf76301d` | 移植过程文档（OverlayFS 记录、根因分析、验收表） | 不属于上游代码修复 |
+
+## 5. 遗留与注意事项
+
+1. #2569 只覆盖 journaled 挂载使用的分配路径；非 journaled 的
+   `fallocate/direct.rs::Edit::Allocate` 仍发布 unwritten extent，
+   本次未改（便于评审，且未在测试路径上）。
+2. 修复前创建、尾部已有 unwritten extent 的旧文件仍会失败（本实现无转换路径），
+   删除/重建即可；这属于数据面历史状态，不影响新写入。
+3. 主 worktree 之后的提交属于下一轮拆分范围，本文未处理；
+   本次未在主 worktree 上新增任何提交。
+4. 本记录文件提交在 `docs/pr-split-2026-10-25-round3` 分支（基于 `origin/master`），
+   已 push 到 `sparkzky`，未开 PR。
