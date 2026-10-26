@@ -84,6 +84,9 @@ TMS 配置里用服务名互访（如 `ip://task-manager:50042`、`ip://gateway:
 
 ## 验收脚本口径（务必按此写，否则会得到「空响应」的假失败）
 
+> 完整操作手册（含镜像准备、启动、坑点与排查）见
+> `docs/ocmanager-porting/running-ocmanager-on-dragonos.md`。
+
 1. **变更类 api 端点需要网关 HMAC 签名**。即使容器里
    `TMS_API_GW_HMAC_STRICT=false`，只要 `TMS_API_GW_HMAC_SECRET` 非空，
    `POST /api/v1/{assets/add,batch_add,remove,ops_tasks/publish,cancel,

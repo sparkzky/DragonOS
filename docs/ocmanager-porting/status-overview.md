@@ -1014,6 +1014,9 @@ gdb 在系统 halted 后读 `CR2` 所在页（`0xffff800340327000`）得到全�
 
 ## 3.50 全量容器移植进展（2026-10-25 晚）
 
+> 操作手册（镜像准备 → 启动 → 部署 → 验收 → 坑点 → 排查）见
+> `docs/ocmanager-porting/running-ocmanager-on-dragonos.md`。
+
 目标：16 个容器（5 infra + 4 app + 7 TMS）全部运行 + 端到端验收。
 计划见 `full-stack-plan-2026-10-25.md`。
 
