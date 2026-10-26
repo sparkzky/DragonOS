@@ -1192,30 +1192,25 @@ per-CPU CSD + seqlock 发布（`AtomicU64 seq` 奇偶保护、`AtomicPtr` 指向
 
 ### 仍未闭环（按优先级）
 
-1. **写入失败已定位到 ext4 unwritten extent（`ada1c760` 诊断确认）**
-   - 直接证据：容器内 sqlite 报
-     `code=SQLITE_IOERR(10) extended=SQLITE_IOERR_WRITE(778) sysErrno=95`；
-     内核侧抓到 `SYS_WRITE` 返回 EOPNOTSUPP，创建点为
-     `another_ext4/src/ext4/extent.rs:636`
-     （`extent_right_spine_projection_from_view`：**文件最后一个 extent 是
-     unwritten 时直接返回 ENOTSUP**）。
-   - 这解释了全部现象：`posix_fallocate`（sqlite、JVM 都会用）产生
-     unwritten extent，之后的 `pwrite`/`write` 就永久失败；
-     `cp` 出来的副本（内容重写成新文件、extent 是 written）正常；
-     重复 uuid 的报错是 UNIQUE 约束（读路径正常）。
-   - 尝试过把 `try_prepare_transactional_range` 的预分配从 unwritten 改为
-     written（该路径先用 `initialize_allocated_range` 把区间写零并 flush，
-     语义等价），但**新建库后仍然失败**，说明还有别的 unwritten 产生点
-     （`extent.rs` 的 `mark_unwritten` 站点：881/952/1007/1843），
-     未验证的改动已回退，不留在树上。
-   - 下一步（明确）：定位剩余的 unwritten 产生点（含 `fallocate_with_context`
-     调用的 crate API），或实现写入时的"未写→已写"转换
-     （对标 Linux `ext4_convert_unwritten_extents`），再做双写验证。
-   - 诊断已提交（每次启动至多打印一次）：`Ext4Error::new` 的
-     `#[track_caller]` 创建点、写回错误与 pcache Loading 归属、
-     syscall 表分派处的 EOPNOTSUPP 名字+栈。
-     注意：`SystemError::to_posix_errno()` 返回**负数**，比较必须用 `-95`；
-     此前诊断一直打印 0 就是踩了这个坑。
+1. **写入失败（ext4 unwritten extent）已修复（`cf2ed782`）**
+   - 根因：写路径 `transaction_extent_query_or_create` 与
+     `preallocate_range_batch` 都给新块打 unwritten 标记，而实现里没有
+     "未写→已写"转换；`extent_right_spine_projection` 一旦遇到尾部
+     unwritten extent 就返回 ENOTSUP（`extent.rs:636`），于是文件第一次
+     成长之后所有写入永久失败。sqlite（`SQLITE_IOERR_WRITE` + errno 95）、
+     JVM/kafka 的 fallocate+写、bitnami entrypoint 写配置都命中；
+     `cp` 出来的副本（新 inode、written extent）正常。
+   - 修复：① 纯写路径的新块（已由 `allocate_initialized_data` 写零、
+     随即写入真实数据）直接发布为 written；② 新增
+     `preallocate_range_batch_initialized`，按"本次操作后是否属于文件
+     有效数据"区分：落在区间内的预分配块标 written，越界（`KEEP_SIZE`
+     越过 EOF）仍保持 unwritten，满足 e2fsck 的 inode 尺寸约束。
+   - 验证（#309，16 容器）：`assets/add` 连续三次全部 `code:OK`
+     （id=1/2/3），重复 uuid 返回 `UNIQUE constraint failed`，
+     不再出现 `operation not supported`。
+   - 注意：修复前创建的、尾部已有 unwritten extent 的旧文件仍会失败
+     （本实现无转换路径）；删除/重建这些文件即可。启动早期仍能看到
+     一次 extent.rs:636 的 ENOTSUP，来自这类历史文件，不影响新写入。
 2. **kafka(JVM)/msg-etl**：OverlayFS 缺页修复后本轮 16 容器全部 Up，
    但历史上曾偶发失败，需要长跑观察确认不再复现。
 3. `docker ps` 中容器退出后其 DNS 记录立即消失，导致依赖方
