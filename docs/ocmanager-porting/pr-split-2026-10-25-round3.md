@@ -94,3 +94,42 @@ JVM/kafka 的预分配后写入都会命中；`cp` 出来的副本（新 inode�
    本次未在主 worktree 上新增任何提交。
 4. 本记录文件提交在 `docs/pr-split-2026-10-25-round3` 分支（基于 `origin/master`），
    已 push 到 `sparkzky`，未开 PR。
+
+## 6. 评审结论与 master 复核（2026-10-26）
+
+两个 PR 均被维护者（fslongjin）**跳过并关闭**：
+
+- **#2568**：master 的 `address_space.rs` 在建 VMA 前调用 `mmap_effective_file`，
+  OverlayFS 返回真实 backing `Arc<File>`，VMA 在 fd 关闭后仍持有该文件
+  （同 Linux `ovl_mmap` 的 `vma_set_file(vma, realfile)`）；因此"VMA 绑 overlay
+  inode"的前提在 master 上不成立。另外本方案只处理 cache-hit 页、缺 cache-miss
+  与 `page_mkwrite`，且按 `current_realdata_inode()` 每次取 backing，copy-up 会
+  切换既有映射的 backing，架构上不完整。
+- **#2569**：master 已具备 unwritten→written 转换（`low_level.rs::write_closed`、
+  `fallocate/direct.rs::direct_publish_written_block_locked`），缓冲分配在尾部
+  unwritten 不能用 append pool 时会回退 eager 分配。提前把 initialized extent
+  发布为 written 会破坏 payload/extent/size 的有序发布不变量，并导致 CI 用例
+  `Ext4DirectRead.UnwrittenExtentUsesZeroReadSemantics` 回归（-1 ≠ 37）。
+
+**独立复核（在 master 上实测）**：用 master（`45754bdc`）内核 #3 + OCManager
+磁盘以 QEMU snapshot 模式启动：
+
+| 检查 | 结果 |
+|---|---|
+| `map_pages() has not yet been implemented for filesystem: OverlayFS` | **0 次**（与维护者判断一致） |
+| 容器内 sqlite（mattn/go-sqlite3，WAL）| 连续 5 次插入全部成功 |
+| 容器内 `fallocate(fd, 0, 0, 64K)` | 返回 `EOPNOTSUPP`（overlayfs 未实现 fallocate），但随后的 `pwrite@0/4096/61440` **全部成功** |
+| OCManager 16 容器 | 仅 7 个 Up：clickhouse `Exited(139)`（用户态 SIGSEGV）、sysdiagnose `Exited(1)`（解析 `clickhouse` 失败）、其余 9 个停在 `Created` |
+
+结论：
+
+1. 这两个 PR 的**前提在 master 上不成立**，跳过不会影响"OCManager 跑在 master"
+   这一目标；#2569 还会引入回归，已关闭是正确的。
+2. master 上 OCManager 起不来的**真正阻塞点不在**这两个 PR：clickhouse 用户态
+   崩溃、依赖服务 DNS 失败、多数容器未启动，属于端口分支上其余未合入的内核改动
+   （#2560/#2562/#2564 等）或 master 自身的缺陷。
+3. 端口分支带到 master 时，应先 rebase 再复测；若本文记录的两个现象仍在 master
+   复现，需按维护者要求提供"VMA 绕过 `mmap_effective_file`"的复现器，以及
+   保持有序发布的写入/转换路径修复。
+4. 另记录一个独立缺口（与上述 PR 无关）：**overlayfs 未实现 `fallocate`**，
+   容器内 `fallocate` 返回 `EOPNOTSUPP`；sqlite 可容忍，但值得单独跟进。
