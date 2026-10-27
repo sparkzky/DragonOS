@@ -176,3 +176,12 @@ JVM/kafka 的预分配后写入都会命中；`cp` 出来的副本（新 inode�
 1. 补 `Err(ENOTSUP) => return Ok(None)` 回退（7 行，直接对齐 master）；
 2. 采用 #2568 的新写法（或直接 rebase 到含 #2446/#2449/#2452 的 master）；
 3. 之后 OCManager 全栈可在不改动 ext4 语义的前提下运行。
+
+### 7.4 重新开 PR（2026-10-26 深夜）
+
+- #2569：确认非必要，已由维护者关闭；端口分支只需补 master 的 7 行回退。
+- #2568：原 PR 在旧版本上被关闭，改版后另开 **#2572
+  （`fix/overlayfs-map-pages`，`1ad2ac7b`，基于 `origin/master` = `0cf86938`）**，
+  并在旧 PR 下留了指向评论。新 PR 保留"VMA 绑定真实 backing 文件"的设计，
+  去掉在 overlay inode 上做页映射的方案，附带端口侧验证
+  （16/16 容器、无 panic、sqlite 与三次资产写入成功）。
